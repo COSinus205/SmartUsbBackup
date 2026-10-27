@@ -1,4 +1,4 @@
-﻿# Smart USB Backup 2.0 (WinUI 3)
+﻿# Smart USB Backup 3.0 (WinUI 3)
 
 Зеркальное резервное копирование USB-флешек для Windows 11. Переписан с WinForms
 на WinUI 3 (Windows App SDK, unpackaged) с исправлением верстки: весь интерфейс —
