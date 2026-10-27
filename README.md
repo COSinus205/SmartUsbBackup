@@ -5,6 +5,14 @@
 строгий `Grid` c `RowDefinitions` (строки: путь → кнопки → настройки → прогресс →
 список флешек), наложения элементов невозможны в принципе.
 
+<div align="center">
+  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v3.0.0">
+    <img src="https://img.shields.io/badge/Download%20installer-3.0.0-blue?style=for-the-badge" alt="Download Smart USB Backup 3.0.0 installer">
+  </a>
+</div>
+
+> Latest installer: [SmartUsbBackup-Setup-3.0.0.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v3.0.0)
+
 ## Логика (без изменений из версии 1.0)
 
 - **0% CPU в простое**: только события — `WM_DEVICECHANGE` (подмена оконной процедуры
