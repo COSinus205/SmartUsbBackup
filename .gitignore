@@ -1,0 +1,6 @@
+﻿bin/
+obj/
+installer/dist/
+*.user
+.vs/
+*.log

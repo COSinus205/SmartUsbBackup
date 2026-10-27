@@ -1,0 +1,211 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Smart USB Backup — главное окно (WinUI 3).
+
+  ВЕРСТКА: строго ОДИН корневой Grid с RowDefinitions. Каждая смысловая панель —
+  своя строка, поэтому наложение элементов (баг старой WinForms-версии, где
+  StatusBar/Panel наезжали на список) здесь невозможно в принципе:
+    Row 0 — путь к папке бэкапов (текст + TextBox + «Обзор...»)
+    Row 1 — панель кнопок действий
+    Row 2 — панель настроек (чекбоксы)
+    Row 3 — блок прогресса (ProgressBar + текст вида «(3 / 14452, 2,9 МБ) F:\...»)
+    Row 4 — список флешек: занимает ВСЁ оставшееся пространство (Height="*")
+-->
+<Window
+    x:Class="SmartUsbBackup.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:core="using:SmartUsbBackup.Core"
+    Title="Smart USB Backup">
+
+  <Grid x:Name="RootGrid" Padding="16,10,16,14" RowSpacing="10">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />  <!-- 0: путь -->
+      <RowDefinition Height="Auto" />  <!-- 1: кнопки -->
+      <RowDefinition Height="Auto" />  <!-- 2: настройки -->
+      <RowDefinition Height="Auto" />  <!-- 3: прогресс -->
+      <RowDefinition Height="*"   />  <!-- 4: список флешек -->
+    </Grid.RowDefinitions>
+
+    <!-- ==================== ROW 0: Папка бэкапов ==================== -->
+    <Grid Grid.Row="0" ColumnSpacing="10">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto" />  <!-- подпись -->
+        <ColumnDefinition Width="*"     />  <!-- путь (растягивается) -->
+        <ColumnDefinition Width="Auto" />  <!-- кнопка «Обзор...» -->
+      </Grid.ColumnDefinitions>
+
+      <TextBlock
+          Grid.Column="0"
+          Text="Папка бэкапов:"
+          VerticalAlignment="Center" />
+
+      <TextBox
+          x:Name="TxtBackupPath"
+          Grid.Column="1"
+          IsReadOnly="True"
+          Text=""
+          VerticalAlignment="Center" />
+
+      <Button
+          x:Name="BtnBrowse"
+          Grid.Column="2"
+          Content="Обзор..."
+          Click="OnBrowseClicked"
+          VerticalAlignment="Center" />
+    </Grid>
+
+    <!-- ==================== ROW 1: Кнопки действий ==================== -->
+    <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="10">
+      <Button
+          x:Name="BtnSyncAll"
+          Content="Синхронизировать всё сейчас"
+          Style="{StaticResource AccentButtonStyle}"
+          Click="OnSyncAllClicked" />
+      <Button
+          x:Name="BtnWipeSelected"
+          Content="Удалить бэкап выбранной"
+          IsEnabled="False"
+          Click="OnWipeSelectedClicked" />
+    </StackPanel>
+
+    <!-- ==================== ROW 2: Настройки (чекбоксы) ==================== -->
+    <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="18">
+      <CheckBox x:Name="ChkMirror"   Content="Зеркало"             Checked="OnMirrorChecked"   Unchecked="OnMirrorUnchecked" />
+      <CheckBox x:Name="ChkCrc"      Content="Проверять CRC32"     Checked="OnCrcChecked"      Unchecked="OnCrcUnchecked" />
+      <CheckBox x:Name="ChkStartup"  Content="Запускать с Windows" Checked="OnStartupChecked"  Unchecked="OnStartupUnchecked" />
+    </StackPanel>
+
+    <!-- ==================== ROW 3: Блок прогресса ====================
+         ДВЕ строки: сверху — полоса прогресса во всю ширину, под ней — подпись.
+         Раньше подпись стояла в одной строке с полосой (колонка Auto): длинный
+         путь раздувал колонку и «съедал» прогресс-бар. Теперь они не пересекаются. -->
+    <Grid Grid.Row="3" RowSpacing="4">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />  <!-- 3.1: полоса прогресса -->
+        <RowDefinition Height="Auto" />  <!-- 3.2: текст «(3 / 14452, 2,9 МБ) F:\...» -->
+      </Grid.RowDefinitions>
+
+      <ProgressBar
+          x:Name="ProgressSync"
+          Grid.Row="0"
+          Maximum="100"
+          Value="0"
+          IsIndeterminate="False"
+          HorizontalAlignment="Stretch" />
+
+      <TextBlock
+          x:Name="TxtStatus"
+          Grid.Row="1"
+          HorizontalAlignment="Stretch"
+          MaxLines="2"
+          TextTrimming="CharacterEllipsis"
+          TextWrapping="Wrap"
+          Text="Ожидание флешки…" />
+    </Grid>
+    <!-- ==================== ROW 4: Список флешек ====================
+         Каркас Border + внутренний Grid (заголовок Auto + список *),
+         поэтому шапка не может «наехать» на строки ни при каком размере окна.
+         Ширины колонок шапки совпадают с ширинами в DataTemplate. -->
+    <Border
+        Grid.Row="4"
+        CornerRadius="6"
+        BorderThickness="1"
+        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto" />
+          <RowDefinition Height="*"   />
+        </Grid.RowDefinitions>
+
+        <!-- Шапка таблицы -->
+        <Grid Grid.Row="0" Padding="12,7,12,7" ColumnSpacing="10"
+              Background="{ThemeResource SubtleFillColorSecondaryBrush}">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="270" />  <!-- Имя (серийник) -->
+            <ColumnDefinition Width="170" />  <!-- Состояние -->
+            <ColumnDefinition Width="160" />  <!-- Есть ли сохранение -->
+            <ColumnDefinition Width="96"  />  <!-- Чекбокс «активна» -->
+            <ColumnDefinition Width="*"   />  <!-- Путь к папке -->
+          </Grid.ColumnDefinitions>
+
+          <TextBlock Grid.Column="0" Text="Имя (серийник)" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+          <TextBlock Grid.Column="1" Text="Состояние"      FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+          <TextBlock Grid.Column="2" Text="Сохранение"     FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+          <TextBlock Grid.Column="3" Text="Активна"        FontWeight="SemiBold" HorizontalAlignment="Center" />
+          <TextBlock Grid.Column="4" Text="Путь к папке"   FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+        </Grid>
+
+        <!-- Строки флешек -->
+        <ListView
+            x:Name="DriveList"
+            Grid.Row="1"
+            SelectionMode="Single"
+            SelectionChanged="OnListSelectionChanged"
+            DoubleTapped="OnListDoubleTapped"
+            ScrollViewer.HorizontalScrollMode="Disabled"
+            ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+
+          <ListView.ItemTemplate>
+            <DataTemplate x:DataType="core:DriveRow">
+              <!-- Ширины колонок ДОЛЖНЫ совпадать с шапкой выше -->
+              <Grid Padding="12,8,12,8" ColumnSpacing="10">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="270" />
+                  <ColumnDefinition Width="170" />
+                  <ColumnDefinition Width="160" />
+                  <ColumnDefinition Width="96"  />
+                  <ColumnDefinition Width="*"   />
+                </Grid.ColumnDefinitions>
+
+                <TextBlock
+                    Grid.Column="0"
+                    Text="{x:Bind Name, Mode=OneWay}"
+                    TextTrimming="CharacterEllipsis"
+                    VerticalAlignment="Center" />
+
+                <TextBlock
+                    Grid.Column="1"
+                    Text="{x:Bind State, Mode=OneWay}"
+                    TextTrimming="CharacterEllipsis"
+                    VerticalAlignment="Center" />
+
+                <TextBlock
+                    Grid.Column="2"
+                    Text="{x:Bind BackupState, Mode=OneWay}"
+                    TextTrimming="CharacterEllipsis"
+                    VerticalAlignment="Center" />
+
+                <CheckBox
+                    Grid.Column="3"
+                    IsChecked="{x:Bind Enabled, Mode=TwoWay}"
+                    Checked="OnRowEnabledChecked"
+                    Unchecked="OnRowEnabledUnchecked"
+                    HorizontalAlignment="Center"
+                    MinWidth="0" />
+
+                <TextBlock
+                    Grid.Column="4"
+                    Text="{x:Bind BackupPath}"
+                    TextTrimming="CharacterEllipsis"
+                    VerticalAlignment="Center"
+                    ToolTipService.ToolTip="{x:Bind BackupPath}" />
+              </Grid>
+            </DataTemplate>
+          </ListView.ItemTemplate>
+
+          <ListView.ItemContainerStyle>
+            <Style TargetType="ListViewItem">
+              <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+              <Setter Property="Padding" Value="0" />
+              <Setter Property="MinHeight" Value="36" />
+            </Style>
+          </ListView.ItemContainerStyle>
+        </ListView>
+      </Grid>
+    </Border>
+
+    <!-- Иконка в трее создаётся в коде (NativeTrayIcon) — вне визуального дерева. -->
+  </Grid>
+</Window>
