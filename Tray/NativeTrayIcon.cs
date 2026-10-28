@@ -56,7 +56,8 @@ internal sealed class NativeTrayIcon : IDisposable
     private const int IDI_APPLICATION = 32512;
 
     private const int CMD_OPEN = 1;
-    private const int CMD_EXIT = 2;
+    private const int CMD_UPDATE = 2;
+    private const int CMD_EXIT = 3;
 
     private readonly WndProcDelegate _wndProc;
     private readonly string _className;
@@ -74,6 +75,9 @@ internal sealed class NativeTrayIcon : IDisposable
 
     /// <summary>Пользователь выбрал «Выход».</summary>
     public event Action? ExitRequested;
+
+    /// <summary>Пользователь выбрал «Проверить обновления».</summary>
+    public event Action? UpdateRequested;
 
     public NativeTrayIcon()
     {
@@ -103,6 +107,8 @@ internal sealed class NativeTrayIcon : IDisposable
 
         _menu = CreatePopupMenu();
         AppendMenu(_menu, MF_STRING, (IntPtr)CMD_OPEN, "Открыть окно");
+        AppendMenu(_menu, MF_SEPARATOR, IntPtr.Zero, null);
+        AppendMenu(_menu, MF_STRING, (IntPtr)CMD_UPDATE, "Проверить обновления");
         AppendMenu(_menu, MF_SEPARATOR, IntPtr.Zero, null);
         AppendMenu(_menu, MF_STRING, (IntPtr)CMD_EXIT, "Выход (остановит синхронизацию)");
 
@@ -271,6 +277,7 @@ internal sealed class NativeTrayIcon : IDisposable
         PostMessage(_hwnd, WM_NULL, IntPtr.Zero, IntPtr.Zero);
 
         if (cmd == CMD_OPEN) OpenRequested?.Invoke();
+        else if (cmd == CMD_UPDATE) UpdateRequested?.Invoke();
         else if (cmd == CMD_EXIT) ExitRequested?.Invoke();
     }
 

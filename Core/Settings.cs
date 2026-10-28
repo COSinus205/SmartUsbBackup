@@ -90,6 +90,10 @@ public sealed class AppSettings
     /// <summary>Список известных флешек.</summary>
     [JsonPropertyName("drives")]
     public List<DriveProfile> Drives { get; set; } = new();
+
+    /// <summary>Последний раз, когда мы проверяли обновления на GitHub.</summary>
+    [JsonPropertyName("lastUpdateCheck")]
+    public DateTime LastUpdateCheck { get; set; } = DateTime.MinValue;
 }
 
 /// <summary>Хранилище настроек: одна точка записи/чтения settings.json.</summary>

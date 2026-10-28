@@ -51,6 +51,7 @@ public sealed partial class MainWindow : Window
 
     // Собственная иконка трея (Shell_NotifyIcon). Создаётся в конструкторе.
     private NativeTrayIcon? _tray;
+    private bool _checkingUpdate;
 
     public MainWindow(bool startHidden)
     {
@@ -77,6 +78,7 @@ public sealed partial class MainWindow : Window
         _tray = new NativeTrayIcon();
         _tray.OpenRequested += () => _dq.TryEnqueue(RestoreWindow);
         _tray.ExitRequested += ExitFromTray;
+        _tray.UpdateRequested += () => _dq.TryEnqueue(() => CheckForUpdatesAsync(true));
         UpdateTrayText();
 
         // Все Click/Checked/Unchecked-обработчики подключены в XAML (атрибуты Click=...).
@@ -148,6 +150,9 @@ public sealed partial class MainWindow : Window
         if (_initialLayoutApplied) return;
         _initialLayoutApplied = true;
         ApplyInitialLayout();
+
+        // Авто-проверка обновлений раз в сутки (разработчик может запретить её в настройках).
+        _ = Task.Delay(8000).ContinueWith(_ => _dq.TryEnqueue(() => CheckForUpdatesAsync(false)));
     }
 
     /// <summary>
@@ -546,6 +551,87 @@ public sealed partial class MainWindow : Window
         catch { /* трей мог не создаться */ }
     }
 
+    // =====================================================================
+    //  АВТО-ОБНОВЛЕНИЕ с GitHub Releases
+    // =====================================================================
+
+    /// <summary>
+    /// Проверить наличие новой версии. В фоне вызывается раз в сутки,
+    /// вручную — по пункту в трее «Проверить обновления».
+    /// </summary>
+    private async Task CheckForUpdatesAsync(bool userInitiated)
+    {
+        if (_checkingUpdate) return;
+        _checkingUpdate = true;
+        try
+        {
+            var now = DateTime.Now;
+            var last = SettingsStore.Current.LastUpdateCheck;
+            if (!userInitiated && (now - last).TotalHours < 24)
+                return;
+
+            SettingsStore.Current.LastUpdateCheck = now;
+            SettingsStore.Save();
+
+            var info = await UpdateService.CheckAsync();
+            var current = UpdateService.AppVersion;
+
+            if (info is null)
+            {
+                if (userInitiated)
+                    await ShowInfoAsync("Обновления", "Не удалось проверить обновления (нет сети?).");
+                return;
+            }
+
+            if (info.Version <= current)
+            {
+                if (userInitiated)
+                    await ShowInfoAsync("Обновления", $"Установлена самая свежая версия ({current}).");
+                return;
+            }
+
+            var dlg = new ContentDialog
+            {
+                Title = "Доступно обновление",
+                Content = $"Новая версия {info.Version} доступна (сейчас {current}). Скачать и установить?",
+                PrimaryButtonText = "Обновить",
+                CloseButtonText = "Позже",
+                DefaultButton = ContentDialogButton.Primary,
+                XamlRoot = Content.XamlRoot,
+            };
+
+            if (await dlg.ShowAsync() != ContentDialogResult.Primary)
+                return;
+
+            dlg.Title = "Загрузка обновления";
+            dlg.Content = "Подготовка…";
+
+            var progress = new Progress<double>(v =>
+                dlg.Content = $"Загрузка: {v * 100:F0}% ({info.Size / 1048576.0:F1} МБ)");
+
+            var path = await UpdateService.DownloadAsync(info, progress);
+            if (path is null)
+            {
+                await ShowInfoAsync("Обновления", "Произошла ошибка загрузки. Попробуйте позже.");
+                return;
+            }
+
+            dlg.Title = "Установка";
+            dlg.Content = "Запуск инсталлятора…";
+            await Task.Delay(400);
+            UpdateService.ApplyUpdate(path);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, "Не удалось проверить/скачать обновление");
+            if (userInitiated)
+                await ShowInfoAsync("Обновления", "Ошибка: " + ex.Message);
+        }
+        finally
+        {
+            _checkingUpdate = false;
+        }
+    }
     // =====================================================================
     //  ПРОГРЕСС: «(3 / 14452, 2,9 МБ) F:\1-2 курс\GOIDA.m»
     // =====================================================================
