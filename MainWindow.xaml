@@ -74,6 +74,8 @@
       <CheckBox x:Name="ChkMirror"   Content="Зеркало"             Checked="OnMirrorChecked"   Unchecked="OnMirrorUnchecked" />
       <CheckBox x:Name="ChkCrc"      Content="Проверять CRC32"     Checked="OnCrcChecked"      Unchecked="OnCrcUnchecked" />
       <CheckBox x:Name="ChkStartup"  Content="Запускать с Windows" Checked="OnStartupChecked"  Unchecked="OnStartupUnchecked" />
+          <CheckBox x:Name="ChkLiveWatch" Content="Обновлять сразу (watch)" Checked="OnLiveChecked" Unchecked="OnLiveUnchecked" ToolTipService.ToolTip="Если включено — изменения на флешке сразу копируются." />
+
     </StackPanel>
 
     <!-- ==================== ROW 3: Блок прогресса ====================

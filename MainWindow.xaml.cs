@@ -87,6 +87,7 @@ public sealed partial class MainWindow : Window
         // события ставят ТУ ЖЕ самое значение, harmless).
         ChkMirror.IsChecked = SettingsStore.Current.MirrorMode;
         ChkCrc.IsChecked = SettingsStore.Current.VerifyByCrc;
+        ChkLiveWatch.IsChecked = SettingsStore.Current.LiveWatch;
     RefreshStartupCheckboxFromRegistry();
         TxtBackupPath.Text = SettingsStore.Current.BaseBackupPath;
 
@@ -356,6 +357,8 @@ public sealed partial class MainWindow : Window
 
     private void OnCrcChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.VerifyByCrc = true);
     private void OnCrcUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.VerifyByCrc = false);
+    private void OnLiveChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.LiveWatch = true);
+    private void OnLiveUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.LiveWatch = false);
 
     private void OnStartupChecked(object sender, RoutedEventArgs e) => ToggleStartup(enable: true);
     private void OnStartupUnchecked(object sender, RoutedEventArgs e) => ToggleStartup(enable: false);

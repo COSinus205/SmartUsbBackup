@@ -6,12 +6,12 @@
 список флешек), наложения элементов невозможны в принципе.
 
 <div align="center">
-  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v3.0.1">
-    <img src="https://img.shields.io/badge/Download%20installer-3.0.1-blue?style=for-the-badge" alt="Download Smart USB Backup 3.0.1 installer">
+  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v3.0.2">
+    <img src="https://img.shields.io/badge/Download%20installer-3.0.2-blue?style=for-the-badge" alt="Download Smart USB Backup 3.0.2 installer">
   </a>
 </div>
 
-> Latest installer: [SmartUsbBackup-Setup-3.0.1.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v3.0.1)
+> Latest installer: [SmartUsbBackup-Setup-3.0.2.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v3.0.2)
 
 ## Логика (без изменений из версии 1.0)
 
@@ -61,7 +61,7 @@ dotnet publish -c Release
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\SmartUsbBackup.iss
 ```
 
-Результат: `installer\dist\SmartUsbBackup-Setup-3.0.1.exe`.
+Результат: `installer\dist\SmartUsbBackup-Setup-3.0.2.exe`.
 
 - Установка per-user: `%LocalAppData%\Programs\SmartUsbBackup`, права админа не нужны.
 - Ярлыки: рабочий стол + меню «Пуск»; опционально автозапуск (HKCU\...\Run, `-hidden`).

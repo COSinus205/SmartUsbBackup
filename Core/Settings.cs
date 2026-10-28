@@ -78,6 +78,15 @@ public sealed class AppSettings
     [JsonPropertyName("skipHiddenSystem")]
     public bool SkipHiddenSystem { get; set; } = true;
 
+    /// <summary>
+    /// Мгновенная синхронизация изменений (FileSystemWatcher): если true —
+    /// добавление/удаление/изменение файла на флешке сразу запускает копирование.
+    /// По умолчанию ВЫКЛЮЧЕНО: полный прогон только при подключении флешки или
+    /// по кнопке «Синхронизировать» (пользователь просит предсказуемость).
+    /// </summary>
+    [JsonPropertyName("liveWatch")]
+    public bool LiveWatch { get; set; } = false;
+
     /// <summary>Список известных флешек.</summary>
     [JsonPropertyName("drives")]
     public List<DriveProfile> Drives { get; set; } = new();

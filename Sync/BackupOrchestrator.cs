@@ -204,12 +204,16 @@ public sealed class BackupOrchestrator : IDisposable
     private async void OnFileChanged(ConnectedSession session, string fullPath)
     {
         if (!session.Profile.Enabled) return;
+        // Мгновенная синхронизация опциональна (по умолчанию выключена): без неё
+        // файлы синхронизируются только при подключении флешки или по кнопке.
+        if (!SettingsStore.Current.LiveWatch) return;
         await session.FsSync.SyncSingleFileAsync(fullPath, session.SourceRoot, session.BackupPath);
     }
 
     private void OnFileDeleted(ConnectedSession session, string fullPath)
     {
         if (!session.Profile.Enabled) return;
+        if (!SettingsStore.Current.LiveWatch) return;
         session.FsSync.DeleteFromBackup(fullPath, session.SourceRoot, session.BackupPath);
     }
 
