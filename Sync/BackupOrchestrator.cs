@@ -256,6 +256,20 @@ public sealed class BackupOrchestrator : IDisposable
     /// </summary>
     public async Task WipeOneAsync(DriveProfile profile)
     {
+        // Safety: бэкап НЕ может указывать на саму папку приложения / *.exe.
+        // Если мусор в settings.json указывает на bin/publish и т.п. — выходим.
+        try
+        {
+            var fullPath = Path.GetFullPath(profile.BackupPath);
+            if (fullPath.Contains("SmartUsbBackup.exe", StringComparison.OrdinalIgnoreCase) ||
+                fullPath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                AppLog.Error(null, "Отказ удаления бэкапа: подозрительный путь (содержит .exe/установку): " + fullPath);
+                return;
+            }
+        }
+        catch { }
+
         var session = _sessions.Values.FirstOrDefault(s =>
             ReferenceEquals(s.Profile, profile) ||
             string.Equals(s.Profile.Serial, profile.Serial, StringComparison.OrdinalIgnoreCase));

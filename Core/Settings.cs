@@ -133,7 +133,32 @@ public static class SettingsStore
             if (File.Exists(FilePath))
             {
                 var s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath));
-                if (s is not null) return s;
+                if (s is not null)
+                {
+                    // Самозащита: путь/профили из повреждённого settings.json (например,
+                    // после копирования резервной копии обратно или неправильной кодировки)
+                    // не должны указывать на исполняемый файл/папку приложения —
+                    // иначе операции «Удалить»/«Синхронизировать» будут «бить» по bin/publish.
+                    if (string.IsNullOrWhiteSpace(s.BaseBackupPath) ||
+                        s.BaseBackupPath.Contains("SmartUsbBackup.exe", StringComparison.OrdinalIgnoreCase) ||
+                        s.BaseBackupPath.Contains("\\bin\\publish\\", StringComparison.OrdinalIgnoreCase) ||
+                        s.BaseBackupPath.Contains("\\SmartUsbBackup.WinUI\\", StringComparison.OrdinalIgnoreCase) ||
+                        s.BaseBackupPath.IndexOfAny(Path.GetInvalidPathChars()) >= 0 ||
+                        !Path.IsPathRooted(s.BaseBackupPath))
+                    {
+                        AppLog.Warn("BaseBackupPath из settings.json некорректен — используется путь по умолчанию: " + s.BaseBackupPath);
+                        s.BaseBackupPath = DefaultBasePath;
+                    }
+
+                    // Нормализуем Profile.FolderName для старых записей without folder name.
+                    foreach (var d in s.Drives ?? new List<DriveProfile>())
+                    {
+                        if (string.IsNullOrWhiteSpace(d.FolderName))
+                            d.FolderName = BuildFolderName(d.Label, d.Serial);
+                    }
+
+                    return s;
+                }
             }
         }
         catch (Exception ex)

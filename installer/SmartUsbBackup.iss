@@ -19,7 +19,7 @@
 ; =====================================================================
 
 #define MyAppName "Smart USB Backup"
-#define MyAppVersion "3.0.3"
+#define MyAppVersion "3.0.4"
 #define MyAppPublisher "Smart USB Backup"
 #define MyAppExeName "SmartUsbBackup.exe"
 #define MyAppId "{C7A5B9E4-2BFE-4D42-A27C-78B9A5C1E1F3}"
