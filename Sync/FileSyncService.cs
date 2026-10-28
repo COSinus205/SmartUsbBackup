@@ -51,7 +51,7 @@ internal readonly record struct FileKey(long Size, DateTime LastWriteUtc);
 public sealed class FileSyncService
 {
     /// <summary>Размер буфера копирования, байт. 256 КБ — «золотая середина» для USB-накопителей.</summary>
-    private const int CHUNK = 256 * 1024;
+    private const int CHUNK = 4 * 1024 * 1024;  // 4 MБ — быстрее на USB-накопителях
 
     private readonly bool _mirror;
     private readonly bool _verifyByCrc;
@@ -141,6 +141,10 @@ public sealed class FileSyncService
                 {
                     Directory.CreateDirectory(Path.GetDirectoryName(dstPath)!);
                     await CopyChunkedAsync(srcPath, dstPath, ct);
+                    // Сохраняем метаданные: иначе на следующем запуске mtime целевого файла
+                    // будет «сейчас» и инкрементальное сравнение всегда будет считать файл новым.
+                    System.IO.File.SetLastWriteTimeUtc(dstPath, srcFi.LastWriteTimeUtc);
+                    try { System.IO.File.SetCreationTimeUtc(dstPath, srcFi.CreationTimeUtc); } catch { /* не критично */ }
                     copied++;
                     bytesCopied += srcFi.Length;
                     targetIndex[rel] = srcKey; // копия теперь идентична источнику
@@ -149,9 +153,6 @@ public sealed class FileSyncService
                 progress?.Report(new SyncProgress(i + 1, sourceFiles.Count,
                     bytesCopied, totalBytes, srcPath, SyncPhase.Copying));
 
-                // Микропауза между файлами, чтобы контроллер флешки и диск не работали на 100%.
-                // Дозируется лишь в «массовой» фазе — это заметно снижает CPU + I/O ожидания.
-                if (copied % 8 == 0) await Task.Yield();
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -174,8 +175,15 @@ public sealed class FileSyncService
             progress?.Report(new SyncProgress(sourceFiles.Count, sourceFiles.Count,
                 bytesCopied, totalBytes, "", SyncPhase.Pruning));
 
+            // Множество файлов, присутствующих на флешке (по относительному пути).
+            // В бэкапе трогаем только то, чего там больше нет.
+            var expectedOnSource = new HashSet<string>(
+                sourceFiles.Select(s => Path.GetRelativePath(sourceDir, s)),
+                StringComparer.OrdinalIgnoreCase);
+
             foreach (var rel in targetIndex.Keys.ToList())
             {
+                if (expectedOnSource.Contains(rel)) continue;
                 ct.ThrowIfCancellationRequested();
                 var dst = Path.Combine(targetDir, rel);
                 try
@@ -214,6 +222,9 @@ public sealed class FileSyncService
             var dst = Path.Combine(targetDir, rel);
             Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
             await CopyChunkedAsync(srcFullPath, dst, CancellationToken.None);
+            var srcInfo = new FileInfo(srcFullPath);
+            System.IO.File.SetLastWriteTimeUtc(dst, srcInfo.LastWriteTimeUtc);
+            try { System.IO.File.SetCreationTimeUtc(dst, srcInfo.CreationTimeUtc); } catch { /* не критично */ }
             AppLog.Info($"[WATCH] Обновлён в бэкапе: {dst}");
             return true;
         }
