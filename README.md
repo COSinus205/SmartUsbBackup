@@ -1,110 +1,61 @@
 ﻿# Smart USB Backup 3.0 (WinUI 3)
 
-Зеркальное резервное копирование USB-флешек для Windows 11. Переписан с WinForms
-на WinUI 3 (Windows App SDK, unpackaged) с исправлением верстки: весь интерфейс —
-строгий `Grid` c `RowDefinitions` (строки: путь → кнопки → настройки → прогресс →
-список флешек), наложения элементов невозможны в принципе.
+Современное приложение для зеркального резервного копирования USB-флешек с нулевой нагрузкой на процессор в режиме ожидания.
 
 <div align="center">
-  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v3.0.7">
-    <img src="https://img.shields.io/badge/Download%20installer-3.0.7-blue?style=for-the-badge" alt="Download Smart USB Backup 3.0.7 installer">
+  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v3.0.6">
+    <img src="https://img.shields.io/badge/Download%20installer-3.0.6-blue?style=for-the-badge" alt="Download Smart USB Backup 3.0.6 installer">
   </a>
 </div>
 
-> Latest installer: [SmartUsbBackup-Setup-3.0.7.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v3.0.7)
+> Latest installer: [SmartUsbBackup-Setup-3.0.6.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v3.0.6)
 
-## Логика (без изменений из версии 1.0)
+## Основные возможности
 
-- **0% CPU в простое**: только события — `WM_DEVICECHANGE` (подмена оконной процедуры
-  через `comctl32!SetWindowSubclass`) и `FileSystemWatcher`. Никакого polling.
-- **Идентификация по Volume Serial Number**, а не по букве диска.
-- **Копирование**: async/await, чанки 256 КБ с `ArrayPool<byte>`, временный `.tmp`
-  + атомарный `Move` (обрыв питания не оставит «недокопированный» файл).
-- **Умный бэкап**: сравнение «размер + дата», опционально CRC32; режим «Зеркало».
-- **Один инстанс** (Mutex) + «второй запуск будит первое окно» (WM_APP).
-
-## Интерфейс
-
-Сверху вниз: путь к папке копий (+ «Обзор...») → кнопки действий → чекбоксы
-(«Зеркало», «Проверять CRC32», «Запускать с Windows») → прогресс → список флешек
-(занимает всё оставшееся место).
-
-- Прогресс — две строки: полоса на всю ширину и подпись под ней, поэтому длинный
-  путь не перекрывает полосу.
-- Список флешек: имя, буква, объём, колонка «Сохранение» («Есть сохранение» /
-  «Нет сохранения») и галочка «Активна».
-- Новая флешка по умолчанию НЕ копируется — сначала нужно поставить «Активна».
-- Снятие галочки, отмена, удаление копии или извлечение флешки останавливают
-  копирование, а прогресс возвращается к «Ожидание флешки…».
-- Удаление копии не убирает флешку из списка.
+- Отслеживание подключения/отключения USB без опроса (событийная модель).
+- Зеркальное копирование с проверкой CRC и режимом «залить как есть».
+- Настраиваемые профили для каждой флешки: зеркало, CRC32, автозапуск, обновление сразу при подключении.
+- Персональные вкладки настроек для каждой флешки.
+- Адаптивный Fluent-интерфейс с вкладками, тёмной/светлой темой и Mica.
+- Работа в фоне и из системного трея, автопроверка обновлений.
 
 ## Сборка
 
-Требуется .NET 8 SDK (Windows 11; Visual Studio 2022 17.8+ — по желанию).
+Требования: .NET 8 SDK, Windows 11, Visual Studio 2022 17.8+ (по желанию).
+
+Сборка приложения:
 
 ```bat
-cd SmartUsbBackup.WinUI
 dotnet publish -c Release
 ```
 
-Результат: папка `bin\publish\` с `SmartUsbBackup.exe` + рядом среда Windows App SDK
-и рантайм .NET 8 (`SelfContained` + `WindowsAppSDKSelfContained`). Публиковать
-одиночным файлом WinUI 3 не умеет (нативным модулям WinUI нужны DLL на диске) —
-инсталлятор упаковывает всю папку в единый Setup.exe.
+Результат: `bin/publish/SmartUsbBackup.exe` и все необходимые файлы (self-contained).
 
-Быстрый запуск без публикации: `dotnet build -c Release`, затем
-`bin\x64\Release\net8.0-windows10.0.22621.0\win-x64\SmartUsbBackup.exe`.
+Для разработки достаточно:
 
-## Установка (Inno Setup 6)
+```bat
+dotnet build -c Release
+```
+
+## Установщик
 
 ```bat
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\SmartUsbBackup.iss
 ```
 
-Результат: `installer\dist\SmartUsbBackup-Setup-3.0.7.exe`.
+Результат: `installer/dist/SmartUsbBackup-Setup-3.0.6.exe`.
 
-- Установка per-user: `%LocalAppData%\Programs\SmartUsbBackup`, права админа не нужны.
-- Ярлыки: рабочий стол + меню «Пуск»; опционально автозапуск (HKCU\...\Run, `-hidden`).
-- Обновление поверх старой версии: папка приложения чистится перед распаковкой.
+Установка per-user, без прав администратора. При удалении предлагается выбрать, какие копии флешек удалить.
 
-## Трей
+## Структура проекта
 
-- Иконка в области уведомлений: левый клик показывает окно, правый — меню
-  «Открыть окно» / «Выход (остановит синхронизацию)».
-- Крестик закрывает окно в трей: синхронизация продолжается, а при подключении
-  флешки появляется уведомление.
-- Windows 11 по умолчанию прячет иконки новых программ в «Скрытые значки».
-  Приложение один раз само переносит иконку в трей (настройка
-  `HKCU\Control Panel\NotifyIconSettings`, `IsPromoted`). Если пользователь
-  скроет её вручную, приложение больше не вмешивается.
-- Реализовано напрямую (`Tray/NativeTrayIcon.cs`: `Shell_NotifyIcon` +
-  `TrackPopupMenuEx`), без сторонних библиотек: H.NotifyIcon на WinUI 3 не
-  доставлял клики по пунктам меню.
+- `MainWindow.xaml` — главное окно с вкладками.
+- `Core/` — модель строк и настроек.
+- `Usb/` — отслеживание устройств и changed-событий.
+- `Sync/` — оркестратор и сервис копирования.
+- `Tray/` — иконка и меню трея.
+- `installer/` — скрипт Inno Setup.
 
-## Деинсталляция
+## Лицензия
 
-«Параметры → Приложения → Smart USB Backup → Удалить»:
-
-1. Кастомное окно (Pascal Script) показывает папки бэкапов
-   (базовый путь читается из `HKCU\Software\SmartUsbBackup\BaseBackupPath`).
-2. Пользователь галочками отмечает, какие копии удалить с ПК; неотмеченные остаются.
-3. Удаляются ярлыки, автозапуск, `.tmp`-файлы; если удалены ВСЕ копии — конфиги
-   (`%LocalAppData%\SmartUsbBackup`), иначе конфиг сохраняется.
-4. В silent-режиме (`/VERYSILENT`) окно не показывается: удаляются только файлы
-   программы и конфиги, папки копий остаются на месте.
-
-## Ключевые файлы
-
-| Файл | Назначение |
-|---|---|
-| `MainWindow.xaml` | Разметка: корневой `Grid`, 5 строк, подложка Mica |
-| `MainWindow.xaml.cs` | Оркестрация UI: прогресс, диалоги (ContentDialog), ListView |
-| `App.xaml(.cs)` | Один инстанс, `-hidden`, глобальные исключения |
-| `Core/Settings.cs` | Настройки + профили флешек (+ дубль базового пути в реестр для деинсталлятора) |
-| `Usb/UsbDeviceWatcher.cs` | `WM_DEVICECHANGE` через `SetWindowSubclass` (WinUI-совместимо) |
-| `Usb/UsbFileWatcher.cs` | `FileSystemWatcher` с коалисцированием событий |
-| `Tray/NativeTrayIcon.cs` | Иконка в трее: `Shell_NotifyIcon`, нативное меню, balloon |
-| `Interop/WindowMinSize.cs` | Минимальный размер окна через `WM_GETMINMAXINFO` (DPI) |
-| `Sync/FileSyncService.cs` | Чанковое копирование с ArrayPool, `.tmp` → `Move`, зеркало |
-| `Sync/BackupOrchestrator.cs` | Связка событий USB → полной/инкрементальной синхронизации |
-| `installer/SmartUsbBackup.iss` | Инсталлятор/деинсталлятор Inno Setup 6 |
+MIT.
