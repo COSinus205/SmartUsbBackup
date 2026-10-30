@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
@@ -175,6 +175,6 @@ public static class UpdateService
         }
 
         // Даём инсталлятору увидеть мутекс приложения и освободить файлы.
-        Task.Delay(1500).ContinueWith(_ => Environment.Exit(0));
+        // Завершить приложение: следующая версия запустится сама через [Run]`n        Environment.Exit(0);
     }
 }

@@ -19,7 +19,7 @@
 ; =====================================================================
 
 #define MyAppName "Smart USB Backup"
-#define MyAppVersion "3.0.5"
+#define MyAppVersion "3.0.6"
 #define MyAppPublisher "Smart USB Backup"
 #define MyAppExeName "SmartUsbBackup.exe"
 #define MyAppId "{C7A5B9E4-2BFE-4D42-A27C-78B9A5C1E1F3}"
@@ -90,7 +90,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 ; ---------- Запуск после установки ----------
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Запустить {#MyAppName}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+Filename: "{app}\{#MyAppExeName}"; Description: "Запустить {#MyAppName}"; Flags: nowait postinstall  runasoriginaluser
 
 ; ---------- Файлы, удаляемые деинсталлятором автоматически ----------
 ; (Папки бэкапов тут НЕ удаляются — их судьбу решает пользователь в кастомном окне.)
@@ -145,7 +145,7 @@ begin
     try
       repeat
         Name := FindRec.Name;
-        if (Name <> '.') and (Name <> '..') and DirExists(Root + '\' + Name) then
+        if (Name <> '.') and (Name <> '..') and (Copy(Name, 1, 4) = 'USB_') and DirExists(Root + '\' + Name) then
         begin
           SetArrayLength(BackupFolders, Count + 1);
           BackupFolders[Count] := Name;
