@@ -53,10 +53,25 @@ public sealed partial class MainWindow : Window
     private NativeTrayIcon? _tray;
     private bool _checkingUpdate;
 
+
     public MainWindow(bool startHidden)
     {
         _startHidden = startHidden;
-        InitializeComponent();
+        try
+        {
+            InitializeComponent();
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                var logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SmartUsbBackup", "crash.log");
+                Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+                File.WriteAllText(logPath, ex.ToString());
+            }
+            catch { }
+            throw;
+        }
 
         // ---------- Первый запуск: создаём настройки ----------
         if (string.IsNullOrEmpty(SettingsStore.Current.BaseBackupPath))
@@ -128,12 +143,32 @@ public sealed partial class MainWindow : Window
         // показа не держится (окно открывалось 640×427 вместо 960×640).
         Activated += OnFirstActivated;
 
+        // ---------- Кастомный TitleBar (Вкладки сливаются с верхней панелью) ----------
+        ExtendsContentIntoTitleBar = true;
+        try { SetTitleBar(MainTabView); } catch { /* не критично */ }
+
+        var systemBar = AppWindow.TitleBar;
+        systemBar.ButtonBackgroundColor = Microsoft.UI.Colors.Transparent;
+        systemBar.ButtonInactiveBackgroundColor = Microsoft.UI.Colors.Transparent;
+        systemBar.PreferredHeightOption = TitleBarHeightOption.Standard;
+
+        // Контейнер верхней панели появляется только после применения шаблона:
+        MainTabView.Loaded += (_, _) => ApplyTitleBarInsets();
+        SizeChanged += (_, _) => ApplyTitleBarInsets();
+        Activated += (_, _) => ApplyTitleBarInsets();
+
+        // ------------------------------------------------------------------------
+
+
         // Крестик = сворачивание в трей (как в WinForms-версии).
         _appWindow.Closing += (_, e) =>
         {
             // Настоящий выход из меню трея: не мешаем окну закрыться,
             // иначе Application.Exit() отменялся и процесс оставался висеть.
-            if (_isExiting) return;
+            if (_isExiting)
+            {
+                return;
+            }
 
             e.Cancel = true; // окно не уничтожаем — оно продолжает слушать USB
             _dq.TryEnqueue(() =>
@@ -151,6 +186,7 @@ public sealed partial class MainWindow : Window
         if (_initialLayoutApplied) return;
         _initialLayoutApplied = true;
         ApplyInitialLayout();
+        ApplyTitleBarInsets();
 
         // Авто-проверка обновлений раз в сутки (разработчик может запретить её в настройках).
         _ = Task.Delay(8000).ContinueWith(_ => _dq.TryEnqueue(() => CheckForUpdatesAsync(false)));
@@ -188,6 +224,61 @@ public sealed partial class MainWindow : Window
             AppLog.Info($"Окно: масштаб {scale:F2}, размер {w}×{h} px");
         }
         catch (Exception ex) { AppLog.Error(ex, "Не удалось задать начальный размер окна"); }
+    }
+
+    /// <summary>
+    /// Настраивает отступы кастомного TitleBar под системные кнопки (Min/Max/Close)
+    /// и явно делает правую зону (DragRegion) зоной перетаскивания через InputNonClientPointerSource.
+    /// </summary>
+    private void ApplyTitleBarInsets()
+    {
+        try
+        {
+            if (MainTabView is null) return;
+
+            double scale = Content?.XamlRoot?.RasterizationScale ?? 0;
+            if (scale <= 0)
+            {
+                uint dpi = GetDpiForWindow(_hwnd);
+                scale = dpi == 0 ? 1.0 : dpi / 96.0;
+            }
+            if (scale <= 0) scale = 1.0;
+
+            double rightInsetDip = AppWindow.TitleBar.RightInset / scale;
+            if (rightInsetDip < 0) rightInsetDip = 0;
+            double leftInsetDip = AppWindow.TitleBar.LeftInset / scale;
+
+            // Контент вкладок должен быть на всю ширину: отступ сбрасываем.
+            MainTabView.Margin = new Thickness(0);
+
+            var titleArea = MainTabView.FindName("TitleArea") as StackPanel;
+            if (titleArea is not null)
+                titleArea.Margin = new Thickness(Math.Max(0, leftInsetDip), 0, 8, 0);
+
+            // Правый отступ только для шапки вкладок (System buttons area).
+            var tabStripSpacer = MainTabView.FindName("TabStripSpacer") as Microsoft.UI.Xaml.FrameworkElement;
+            if (tabStripSpacer is not null)
+                tabStripSpacer.Width = Math.Max(0, rightInsetDip);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, "Не удалось настроить TitleBar insets");
+        }
+    }
+
+    private static DependencyObject? FindNamedDescendant(DependencyObject root, string name)
+    {
+        if (root is FrameworkElement fe && fe.Name == name)
+            return root;
+
+        int count = VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < count; i++)
+        {
+            var child = VisualTreeHelper.GetChild(root, i);
+            var found = FindNamedDescendant(child, name);
+            if (found is not null) return found;
+        }
+        return null;
     }
 
     /// <summary>Вторая копия приложения (или пользователь) просит показать окно.</summary>
@@ -417,12 +508,65 @@ public sealed partial class MainWindow : Window
     private void OnListSelectionChanged(object sender, SelectionChangedEventArgs e)
         => BtnWipeSelected.IsEnabled = DriveList.SelectedItem is DriveRow;
 
+
+
+
+
+    private void MainTabView_TabCloseRequested(TabView sender, TabViewTabCloseRequestedEventArgs args)
+    {
+        sender.TabItems.Remove(args.Tab);
+    }
+
     private void OnListDoubleTapped(object sender, Microsoft.UI.Xaml.Input.DoubleTappedRoutedEventArgs e)
     {
         // Двойной клик по строке — немедленная синхронизация этой флешки.
         if (DriveList.SelectedItem is DriveRow row && row.Profile.Enabled)
             _orchestrator.SyncOne(row.Profile);
     }
+
+    private void PerDriveSettings_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement { DataContext: DriveRow row })
+            return;
+
+        string driveId = !string.IsNullOrWhiteSpace(row.Profile.Serial)
+            ? row.Profile.Serial
+            : row.Name;
+
+        foreach (var item in MainTabView.TabItems)
+        {
+            if (item is TabViewItem existingTab && existingTab.Tag as string == driveId)
+            {
+                MainTabView.SelectedItem = existingTab;
+                return;
+            }
+        }
+
+        var tab = new TabViewItem
+        {
+            Header = row.Name,
+            IsClosable = true,
+            Tag = driveId,
+            Content = new Grid
+            {
+                Padding = new Thickness(16),
+                Children =
+                {
+                    new TextBlock
+                    {
+                        Text = "Настройки в разработке",
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        VerticalAlignment = VerticalAlignment.Center,
+                        FontSize = 18
+                    }
+                }
+            }
+        };
+
+        MainTabView.TabItems.Add(tab);
+        MainTabView.SelectedItem = tab;
+    }
+
 
     private void OnRowEnabledChecked(object sender, RoutedEventArgs e) => OnRowEnabledChanged(sender, true);
     private void OnRowEnabledUnchecked(object sender, RoutedEventArgs e) => OnRowEnabledChanged(sender, false);
@@ -554,6 +698,9 @@ public sealed partial class MainWindow : Window
         ProgressSync.Value = 0;
         TxtStatus.Text = "Ожидание флешки…";
     }
+
+
+
 
     private void UpdateTrayText()
     {
