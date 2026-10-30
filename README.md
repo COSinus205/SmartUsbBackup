@@ -49,12 +49,29 @@ dotnet build -c Release
 
 ## Структура проекта
 
-- `MainWindow.xaml` — главное окно с вкладками.
-- `Core/` — модель строк и настроек.
-- `Usb/` — отслеживание устройств и changed-событий.
-- `Sync/` — оркестратор и сервис копирования.
-- `Tray/` — иконка и меню трея.
-- `installer/` — скрипт Inno Setup.
+| Путь | Назначение |
+|---|---|
+| `SmartUsbBackup.WinUI.csproj` | Основной проект WinUI 3 (.NET 8, unpackaged, self-contained). |
+| `app.manifest` | Манифест приложения (DPI-aware, UAC). |
+| `App.xaml` / `App.xaml.cs` | Точка входа: одиночный экземпляр, аргумент `-hidden`, исключения. |
+| `MainWindow.xaml` / `MainWindow.xaml.cs` | Главное окно, вкладки, таблица флешек, логика UI. |
+| `Assets/appicon.ico` | Иконка приложения/окна/установщика. |
+| `build-installer.bat` | Сборка через `dotnet publish` + Inno Setup. |
+| `README.md` | Документация проекта. |
+| `Core/AppLog.cs` | Логирование (`AppLog.Info/Error`). |
+| `Core/DriveRow.cs` | Модель строки таблицы флешек (INotifyPropertyChanged). |
+| `Core/Settings.cs` | `AppSettings`/`SettingsStore`, чтение/сохранение `settings.json`. |
+| `Core/UpdateService.cs` | Проверка и скачивание обновлений через GitHub Releases. |
+| `Sync/BackupOrchestrator.cs` | Оркестрация синхронизации (подключение/отключение, sync all/one, wipe). |
+| `Sync/FileSyncService.cs` | Копирование файлов (ArrayPool, `.tmp`, Move, CRC32). |
+| `Sync/Crc32.cs` | Расчёт CRC32. |
+| `Usb/UsbDeviceWatcher.cs` | `WM_DEVICECHANGE` через subclass окна (без polling). |
+| `Usb/UsbFileWatcher.cs` | `FileSystemWatcher` для live-watch. |
+| `Tray/NativeTrayIcon.cs` | Трей: `Shell_NotifyIcon`, меню, balloon. |
+| `Interop/NativeMethods.cs` | Win32-interop/helper'ы (ShowWindow, SetForegroundWindow и др.). |
+| `Interop/WindowMinSize.cs` | Минимальный размер окна через `WM_GETMINMAXINFO`. |
+| `installer/SmartUsbBackup.iss` | Скрипт Inno Setup (per-user install, деинсталляция, Pascal Script). |
+| `installer/dist/SmartUsbBackup-Setup-3.0.6.exe` | Собранный установщик (релиз). |
 
 ## Лицензия
 
