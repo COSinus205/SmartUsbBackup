@@ -76,10 +76,10 @@ public sealed partial class MainWindow : Window
         // Трей: нативное меню + иконка. Клик по иконке/«Открыть окно» показывает
         // окно, «Выход» завершает приложение.
         _tray = new NativeTrayIcon();
-        _tray.OpenRequested += () => _dq.TryEnqueue(RestoreWindow);
-        _tray.ToggleRequested += () => _dq.TryEnqueue(ToggleWindow);
+        _tray.OpenRequested += () => { _ = _dq.TryEnqueue(RestoreWindow); };
+        _tray.ToggleRequested += () => { _ = _dq.TryEnqueue(ToggleWindow); };
         _tray.ExitRequested += ExitFromTray;
-        _tray.UpdateRequested += () => _dq.TryEnqueue(() => CheckForUpdatesAsync(true));
+        _tray.UpdateRequested += () => { _ = _dq.TryEnqueue(() => CheckForUpdatesAsync(true)); };
         UpdateTrayText();
 
         // Все Click/Checked/Unchecked-обработчики подключены в XAML (атрибуты Click=...).
@@ -488,14 +488,13 @@ public sealed partial class MainWindow : Window
 
             if (row is null)
             {
-                _rows.Insert(Math.Min(i, _rows.Count), new DriveRow(profile));
-                row = _rows[i];
+                var newRow = new DriveRow(profile);
+                _rows.Add(newRow);
+                row = newRow;
             }
-            else
-            {
-                var currentIndex = _rows.IndexOf(row);
-                if (currentIndex != i) _rows.Move(currentIndex, i);
-            }
+            // Не переставляем строки: коллекция могла потерять элементы из-за фильтра;
+            // _rows.Move(currentIndex, i) здесь небезопасен (ArgumentOutOfRange).
+
 
             row.Enabled = profile.Enabled;
             row.RefreshState(ComputeState(profile));
