@@ -70,8 +70,11 @@ internal sealed class NativeTrayIcon : IDisposable
     private string _tip = "Smart USB Backup";
     private bool _disposed;
 
-    /// <summary>Пользователь выбрал «Открыть окно» (или кликнул по иконке).</summary>
+    /// <summary>Показать окно (правый клик → меню «Открыть окно»).</summary>
     public event Action? OpenRequested;
+
+    /// <summary>Переключить видимость окна: левый клик по иконке.</summary>
+    public event Action? ToggleRequested;
 
     /// <summary>Пользователь выбрал «Выход».</summary>
     public event Action? ExitRequested;
@@ -290,7 +293,8 @@ internal sealed class NativeTrayIcon : IDisposable
             {
                 case WM_LBUTTONUP:
                 case WM_LBUTTONDBLCLK:
-                    OpenRequested?.Invoke();
+                    // Левый клик = toggle (показать/скрыть).
+                    ToggleRequested?.Invoke();
                     break;
 
                 case WM_RBUTTONUP:

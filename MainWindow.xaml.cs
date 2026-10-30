@@ -77,6 +77,7 @@ public sealed partial class MainWindow : Window
         // окно, «Выход» завершает приложение.
         _tray = new NativeTrayIcon();
         _tray.OpenRequested += () => _dq.TryEnqueue(RestoreWindow);
+        _tray.ToggleRequested += () => _dq.TryEnqueue(ToggleWindow);
         _tray.ExitRequested += ExitFromTray;
         _tray.UpdateRequested += () => _dq.TryEnqueue(() => CheckForUpdatesAsync(true));
         UpdateTrayText();
@@ -463,11 +464,26 @@ public sealed partial class MainWindow : Window
         for (int i = _rows.Count - 1; i >= 0; i--)
             if (!profiles.Contains(_rows[i].Profile))
                 _rows.RemoveAt(i);
+        // Убираем строки, не удовлетворяющие условию отображения (см. ниже).
+        for (int i = _rows.Count - 1; i >= 0; i--)
+        {
+            var proj = _rows[i].Profile;
+            bool present = _orchestrator.ActiveSessions.Any(s =>
+                ReferenceEquals(s.Profile, proj) ||
+                string.Equals(s.Profile.Serial, proj.Serial, StringComparison.OrdinalIgnoreCase));
+            bool keep = proj.Enabled || present || HasBackup(proj.BackupPath) == "Есть сохранение";
+            if (!keep) _rows.RemoveAt(i);
+        }
 
         // 2) добавляем/сдвигаем/обновляем в порядке настроек
         for (int i = 0; i < profiles.Count; i++)
         {
             var profile = profiles[i];
+            bool present = _orchestrator.ActiveSessions.Any(s =>
+                ReferenceEquals(s.Profile, profile) ||
+                string.Equals(s.Profile.Serial, profile.Serial, StringComparison.OrdinalIgnoreCase));
+            bool hasBackup = HasBackup(profile.BackupPath) == "Есть сохранение";
+            if (!(profile.Enabled || present || hasBackup)) continue;
             var row = _rows.FirstOrDefault(r => ReferenceEquals(r.Profile, profile));
 
             if (row is null)
@@ -730,6 +746,22 @@ public sealed partial class MainWindow : Window
     // =====================================================================
     //  ТРЕЙ
     // =====================================================================
+
+    /// <summary>Переключить видимость окна (левый клик по иконке трея).</summary>
+    private void ToggleWindow()
+    {
+        try
+        {
+            if (_appWindow.IsVisible)
+            {
+                _appWindow.Hide();
+                UpdateTrayText();
+                return;
+            }
+        }
+        catch { /* falls through to restore */ }
+        RestoreWindow();
+    }
 
     /// <summary>«Выход» в меню трея: останавливаем всё и завершаем процесс.</summary>
     private void ExitFromTray()
