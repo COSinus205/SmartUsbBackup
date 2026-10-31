@@ -73,6 +73,40 @@ dotnet build -c Release
 | `installer/SmartUsbBackup.iss` | Скрипт Inno Setup (per-user install, деинсталляция, Pascal Script). |
 | `installer/dist/SmartUsbBackup-Setup-3.0.6.exe` | Собранный установщик (релиз). |
 
+## CI / Сборка
+
+![CI](https://github.com/COSinus205/SmartUsbBackup/actions/workflows/ci.yml/badge.svg)
+
+Запуск тестов локально:
+
+```bat
+dotnet test SmartUsbBackup.Tests/SmartUsbBackup.Tests.csproj
+```
+
+Сборка без Visual Studio:
+
+```bat
+dotnet build SmartUsbBackup.WinUI.csproj -c Release -p:Platform=x64
+```
+
+## Безопасность
+
+Проверяется при автообновлении:
+- SHA-256 скачанного файла (обязательно; при несовпадении — отказ).
+- Authenticode-подпись (сейчас в режиме предупреждения, так как сертификат ещё не получен; при появлении сертификата станет обязательной).
+- allowlist хостов загрузки (только `github.com` и GitHub CDN).
+
+Осознанно НЕ проверяется:
+- TLS-pinning (доверяем стандартной проверке сертификатов Windows).
+- Authenticode-издатель (будет включено после получения сертификата).
+
+Сообщить об уязвимости: через GitHub Security Advisories (вкладка Security репозитория) или [TODO: указать email владельца].
+
+## Флешки без серийного номера
+
+Такие флешки получают профиль `NOSERIAL-XXXXXXXX` на основе метки тома; две разные флешки без серийника и с одинаковой меткой могут слиться в один профиль.
+
 ## Лицензия
 
 MIT.
+

@@ -135,19 +135,16 @@ public static class SettingsStore
                 var s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath));
                 if (s is not null)
                 {
-                    // Самозащита: путь/профили из повреждённого settings.json (например,
-                    // после копирования резервной копии обратно или неправильной кодировки)
-                    // не должны указывать на исполняемый файл/папку приложения —
-                    // иначе операции «Удалить»/«Синхронизировать» будут «бить» по bin/publish.
-                    if (string.IsNullOrWhiteSpace(s.BaseBackupPath) ||
-                        s.BaseBackupPath.Contains("SmartUsbBackup.exe", StringComparison.OrdinalIgnoreCase) ||
-                        s.BaseBackupPath.Contains("\\bin\\publish\\", StringComparison.OrdinalIgnoreCase) ||
-                        s.BaseBackupPath.Contains("\\SmartUsbBackup.WinUI\\", StringComparison.OrdinalIgnoreCase) ||
-                        s.BaseBackupPath.IndexOfAny(Path.GetInvalidPathChars()) >= 0 ||
-                        !Path.IsPathRooted(s.BaseBackupPath))
+                    // SEC: D-01 — каноническая проверка вместо чёрного списка подстрок.
+                    var canonicalBase = PathSafety.CanonicalizeBase(s.BaseBackupPath);
+                    if (canonicalBase is null)
                     {
-                        AppLog.Warn("BaseBackupPath из settings.json некорректен — используется путь по умолчанию: " + s.BaseBackupPath);
+                        AppLog.Warn("BaseBackupPath из settings.json небезопасен/некорректен — используется путь по умолчанию: " + s.BaseBackupPath);
                         s.BaseBackupPath = DefaultBasePath;
+                    }
+                    else
+                    {
+                        s.BaseBackupPath = canonicalBase;
                     }
 
                     // Нормализуем Profile.FolderName для старых записей without folder name.
@@ -178,7 +175,7 @@ public static class SettingsStore
             try
             {
                 Directory.CreateDirectory(Dir);
-                var tmp = FilePath + ".tmp";
+                var tmp = FilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 File.WriteAllText(tmp, JsonSerializer.Serialize(Current, JsonOpts));
                 if (File.Exists(FilePath)) File.Delete(FilePath);
                 File.Move(tmp, FilePath);
@@ -201,6 +198,17 @@ public static class SettingsStore
     /// <summary>Найти профиль по серийному номеру (или создать новый, если отсутствует).</summary>
     public static DriveProfile GetOrCreate(string serial, string label)
     {
+        // SEC: C-02 — пустой/whitespace серийный номер заменяем на дневной fallback-ключ.
+        if (string.IsNullOrWhiteSpace(serial))
+        {
+            AppLog.Warn("Пустой серийный номер USB — используется fallback-ключ");
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            var labelPart = string.IsNullOrWhiteSpace(label) ? "NO_LABEL" : label.Trim();
+            var hashInput = labelPart + "|NOSERIAL";
+            serial = "NOSERIAL-" + Convert.ToHexString(
+                sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(hashInput)))[..8];
+        }
+
         lock (gate)
         {
             var found = Current.Drives.Find(d =>
@@ -223,6 +231,19 @@ public static class SettingsStore
                 found.Label = label;
                 Save();
             }
+
+            // SEC: C-02 — перегенерация небезопасного FolderName (fail-safe).
+            if (PathSafety.IsReservedWindowsName(found.FolderName) ||
+                found.FolderName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+                found.FolderName.Contains("..", StringComparison.Ordinal) ||
+                found.FolderName.Contains(Path.DirectorySeparatorChar) ||
+                found.FolderName.Contains(Path.AltDirectorySeparatorChar))
+            {
+                found.FolderName = BuildFolderName(found.Label, found.Serial);
+                Save();
+                AppLog.Warn("FolderName перегенерирован как небезопасный: " + found.FolderName);
+            }
+
             return found;
         }
     }
@@ -239,6 +260,26 @@ public static class SettingsStore
             else sb.Append(ch);
         }
         sb.Append('_').Append(serial.Replace("-", "").Replace(":", ""));
-        return sb.ToString();
+
+        // SEC: C-01 — финальная санитизация.
+        var name = sb.ToString().TrimEnd(' ', '.');
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            using var sha0 = System.Security.Cryptography.SHA256.Create();
+            var bytes0 = System.Text.Encoding.UTF8.GetBytes(serial ?? string.Empty);
+            var hash0 = sha0.ComputeHash(bytes0);
+            name = "USB_" + Convert.ToHexString(hash0)[..8];
+        }
+        if (PathSafety.IsReservedWindowsName(name))
+            name = "_" + name;
+        if (name.Length > 80)
+        {
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            var hashInput = (label ?? string.Empty) + (serial ?? string.Empty);
+            var hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(hashInput));
+            var suffix = Convert.ToHexString(hash)[..8];
+            name = name.Substring(0, Math.Min(name.Length, 80)) + "_" + suffix;
+        }
+        return name;
     }
 }

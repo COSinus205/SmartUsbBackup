@@ -28,5 +28,14 @@ if errorlevel 1 (
 )
 
 echo.
+echo === Step 3: SHA-256 sidecars ===
+powershell -NoProfile -Command "Get-ChildItem 'installer\dist\SmartUsbBackup-Setup-*.exe' | ForEach-Object { $h=(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(); [IO.File]::WriteAllText($_.FullName + '.sha256', $h) }"
+if errorlevel 1 (
+    echo SHA-256 generation failed. Aborting.
+    pause
+    exit /b 1
+)
+
+echo.
 echo === Done: installer is in installer\dist ===
 pause

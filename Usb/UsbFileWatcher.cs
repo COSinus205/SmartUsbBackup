@@ -27,6 +27,8 @@ public sealed class UsbFileWatcher : IDisposable
 
     public event Action<string>? FileChanged;   // относительный или полный путь — полный
     public event Action<string>? FileDeleted;
+    // SEC: F-01 — переполнение буфера FSW.
+    public event Action? OverflowDetected;
 
     private readonly FileSystemWatcher _fsw;
     private readonly string _sourceDir;
@@ -54,7 +56,12 @@ public sealed class UsbFileWatcher : IDisposable
         _fsw.Changed += (_, e) => QueueChange(e.FullPath);
         _fsw.Renamed += (_, e) => { QueueDelete(e.OldFullPath); QueueChange(e.FullPath); };
         _fsw.Deleted += (_, e) => QueueDelete(e.FullPath);
-        _fsw.Error += (_, e) => AppLog.Error(e.GetException(), "[WATCH] Переполнение FileSystemWatcher — нужна полная синхронизация");
+        _fsw.Error += (_, e) =>
+        {
+            AppLog.Error(e.GetException(), "[WATCH] Переполнение FileSystemWatcher — нужна полная синхронизация");
+            try { OverflowDetected?.Invoke(); }
+            catch (Exception ex) { AppLog.Error(ex, "[WATCH] Ошибка обработчика OverflowDetected"); }
+        };
 
         // ОДИН таймер на всё окно наблюдения: каждые 1.2 с проверяем очередь.
         // Таймер НЕ крутит сканирование диска — он лишь отжимает копию из очереди (список путей),

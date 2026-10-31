@@ -68,6 +68,11 @@
     <PublishDir>$(MSBuildThisFileDirectory)bin\publish\</PublishDir>
   </PropertyGroup>
 
+  <!-- Тесты живут в отдельном проекте SmartUsbBackup.Tests и не должны компилироваться в основной сборке -->
+  <ItemGroup>
+    <Compile Remove="SmartUsbBackup.Tests\**\*.cs" />
+  </ItemGroup>
+
   <!--
     dotnet publish не переносит resources.pri в папку публикации (в отличие от обычной сборки),
     поэтому копируем его вручную. Без resources.pri WinUI не находит XBF и падает с

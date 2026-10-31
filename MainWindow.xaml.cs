@@ -752,6 +752,23 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
+            bool allowUnverified = false;
+            if (string.IsNullOrWhiteSpace(info.Sha256))
+            {
+                var unverifiedDlg = new ContentDialog
+                {
+                    Title = "Обновление без проверки целостности",
+                    Content = "SHA-256 для этого обновления недоступен. Продолжить на свой риск?",
+                    PrimaryButtonText = "Продолжить",
+                    CloseButtonText = "Отменить",
+                    DefaultButton = ContentDialogButton.Close,
+                    XamlRoot = Content.XamlRoot,
+                };
+                if (await unverifiedDlg.ShowAsync() != ContentDialogResult.Primary)
+                    return;
+                allowUnverified = true;
+            }
+
             var dlg = new ContentDialog
             {
                 Title = "Доступно обновление",
@@ -771,7 +788,7 @@ public sealed partial class MainWindow : Window
             var progress = new Progress<double>(v =>
                 dlg.Content = $"Загрузка: {v * 100:F0}% ({info.Size / 1048576.0:F1} МБ)");
 
-            var path = await UpdateService.DownloadAsync(info, progress);
+            var path = await UpdateService.DownloadAsync(info, progress, allowUnverified: allowUnverified);
             if (path is null)
             {
                 await ShowInfoAsync("Обновления", "Произошла ошибка загрузки. Попробуйте позже.");

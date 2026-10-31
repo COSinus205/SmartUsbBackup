@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using SmartUsbBackup.Core;
 
 namespace SmartUsbBackup.Sync;
 
@@ -168,33 +169,63 @@ public sealed class FileSyncService
             }
         }
 
-        // 2) Режим «ЗЕРКАЛО»: удалить из бэкапа файлы, которых больше нет на флешке.
         int deleted = 0;
         if (_mirror)
         {
+            // SEC: B-04 — удалять только внутри targetDir, без reparse points.
             progress?.Report(new SyncProgress(sourceFiles.Count, sourceFiles.Count,
                 bytesCopied, totalBytes, "", SyncPhase.Pruning));
 
-            // Множество файлов, присутствующих на флешке (по относительному пути).
-            // В бэкапе трогаем только то, чего там больше нет.
-            var expectedOnSource = new HashSet<string>(
-                sourceFiles.Select(s => Path.GetRelativePath(sourceDir, s)),
-                StringComparer.OrdinalIgnoreCase);
-
-            foreach (var rel in targetIndex.Keys.ToList())
+            var fullTargetDir = Path.GetFullPath(targetDir);
+            // Защита от удаления корня диска/системной папки.
+            var root = Path.GetPathRoot(fullTargetDir);
+            if (string.IsNullOrWhiteSpace(root) ||
+                string.Equals(fullTargetDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                             root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                             StringComparison.OrdinalIgnoreCase))
             {
-                if (expectedOnSource.Contains(rel)) continue;
-                ct.ThrowIfCancellationRequested();
-                var dst = Path.Combine(targetDir, rel);
-                try
-                {
-                    System.IO.File.Delete(dst);
-                    deleted++;
-                    AppLog.Info($"[MIRROR] Удалён из бэкапа: {dst}");
-                }
-                catch (Exception ex) { AppLog.Error(ex, $"Не удалось удалить {dst}"); }
+                AppLog.Error(null, "SEC B-04: mirror pruning отменён — targetDir является корнем");
             }
-            CleanupEmptyDirs(targetDir);
+            else
+            {
+                // Множество файлов, присутствующих на флешке (по относительному пути).
+                var expectedOnSource = new HashSet<string>(
+                    sourceFiles.Select(s => Path.GetRelativePath(sourceDir, s)),
+                    StringComparer.OrdinalIgnoreCase);
+
+                var sep = Path.DirectorySeparatorChar;
+                var prefix = fullTargetDir.TrimEnd(sep) + sep;
+
+                foreach (var rel in targetIndex.Keys.ToList())
+                {
+                    if (expectedOnSource.Contains(rel)) continue;
+                    ct.ThrowIfCancellationRequested();
+
+                    string dst;
+                    try { dst = Path.GetFullPath(Path.Combine(fullTargetDir, rel)); }
+                    catch { AppLog.Error(null, "SEC B-04: некорректный путь: " + rel); continue; }
+
+                    if (!dst.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        AppLog.Error(null, "SEC B-04: отказ удаления вне targetDir: " + dst);
+                        continue;
+                    }
+                    if (PathSafety.ContainsReparsePoint(dst))
+                    {
+                        AppLog.Error(null, "SEC B-04: отказ удаления — reparse point: " + dst);
+                        continue;
+                    }
+
+                    try
+                    {
+                        System.IO.File.Delete(dst);
+                        deleted++;
+                        AppLog.Info($"[MIRROR] Удалён из бэкапа: {dst}");
+                    }
+                    catch (Exception ex) { AppLog.Error(ex, $"Не удалось удалить {dst}"); }
+                }
+                CleanupEmptyDirs(fullTargetDir);
+            }
         }
 
         progress?.Report(new SyncProgress(sourceFiles.Count, sourceFiles.Count,

@@ -54,12 +54,15 @@ public sealed class UsbDeviceWatcher
 
     private IntPtr SubclassHandler(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, uint id, IntPtr refData)
     {
-        // Приватная команда от второго инстанса App — развернуть главное окно.
-        if (IsRestoreMessage(msg))
+        // SEC: G-01 — исключения на границе native→managed не должны ронять процесс.
+        try
         {
-            RestoreRequested?.Invoke();
-            return DefSubclassProc(hWnd, msg, wParam, lParam);
-        }
+            if (IsRestoreMessage(msg))
+            {
+                RestoreRequested?.Invoke();
+                return DefSubclassProc(hWnd, msg, wParam, lParam);
+            }
+
 
         if (msg == WM_DEVICECHANGE)
         {
@@ -81,6 +84,12 @@ public sealed class UsbDeviceWatcher
         }
 
         return DefSubclassProc(hWnd, msg, wParam, lParam);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, "[USB] Необработанное исключение в SubclassHandler");
+            return DefSubclassProc(hWnd, msg, wParam, lParam);
+        }
     }
 
     /// <summary>Разбираем битовую маску на буквы дисков и поднимаем события.</summary>

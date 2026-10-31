@@ -66,6 +66,17 @@ public sealed class BackupOrchestrator : IDisposable
 
         session.FileWatcher.FileChanged += path => OnFileChanged(session, path);
         session.FileWatcher.FileDeleted += path => OnFileDeleted(session, path);
+        // SEC: F-01 — при переполнении буфера FSW запускаем полную синхронизацию.
+        session.FileWatcher.OverflowDetected += () =>
+        {
+            try
+            {
+                if (!session.Profile.Enabled) return;
+                if (_fullSyncs.ContainsKey(session.Letter.ToString())) return;
+                StartFullSync(session);
+            }
+            catch (Exception ex) { AppLog.Error(ex, "[USB] Не удалось запустить полную синхронизацию после overflow"); }
+        };
         _sessions[$"{e.DriveLetter}"] = session;
 
         StateChanged?.Invoke();
@@ -227,6 +238,19 @@ public sealed class BackupOrchestrator : IDisposable
     /// </summary>
     public void WipeEverything()
     {
+        // SEC: B-01 — каноническая проверка базового пути до удаления.
+        var canonicalBase = PathSafety.CanonicalizeBase(SettingsStore.Current.BaseBackupPath);
+        if (canonicalBase is null)
+        {
+            AppLog.Error(null, "SEC B-01: WipeEverything отменён — небезопасный базовый путь: " + SettingsStore.Current.BaseBackupPath);
+            return;
+        }
+        if (Directory.Exists(canonicalBase) && PathSafety.ContainsReparsePoint(canonicalBase))
+        {
+            AppLog.Error(null, "SEC B-01: WipeEverything отменён — reparse point в пути");
+            return;
+        }
+
         foreach (var letter in _sessions.Keys)
         {
             if (_fullSyncs.TryRemove(letter, out var cts)) { cts.Cancel(); cts.Dispose(); }
@@ -236,14 +260,15 @@ public sealed class BackupOrchestrator : IDisposable
 
         try
         {
-            if (Directory.Exists(SettingsStore.Current.BaseBackupPath))
-                Directory.Delete(SettingsStore.Current.BaseBackupPath, recursive: true);
+            if (Directory.Exists(canonicalBase))
+                Directory.Delete(canonicalBase, recursive: true);
             SettingsStore.Current.Drives.Clear();
             SettingsStore.Save();
             AppLog.Info("Все бэкапы и настройки удалены");
         }
         catch (Exception ex) { AppLog.Error(ex, "Не удалось полностью очистить бэкапы"); }
     }
+
 
     /// <summary>
     /// Удалить бэкап ОДНОЙ флешки (кнопка «Удалить бэкап выбранной»).
@@ -256,15 +281,47 @@ public sealed class BackupOrchestrator : IDisposable
     /// </summary>
     public async Task WipeOneAsync(DriveProfile profile)
     {
-        // Safety: бэкап НЕ может указывать на саму папку приложения / *.exe.
-        // Если мусор в settings.json указывает на bin/publish и т.п. — выходим.
+        // SEC: B-02/D-01 — каноническая проверка базы и принадлежности BackupPath.
+        var canonicalBase = PathSafety.CanonicalizeBase(SettingsStore.Current.BaseBackupPath);
+        if (canonicalBase is null)
+        {
+            AppLog.Error(null, "SEC B-02: WipeOneAsync отменён — небезопасный базовый путь");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(profile.FolderName) ||
+            profile.FolderName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+            profile.FolderName.Contains("..", StringComparison.Ordinal) ||
+            profile.FolderName.Contains(Path.DirectorySeparatorChar) ||
+            profile.FolderName.Contains(Path.AltDirectorySeparatorChar) ||
+            PathSafety.IsReservedWindowsName(profile.FolderName))
+        {
+            AppLog.Error(null, "SEC B-02: WipeOneAsync отменён — небезопасное имя папки: " + profile.FolderName);
+            return;
+        }
+
+        string fullBackupPath;
+        try { fullBackupPath = Path.GetFullPath(profile.BackupPath); }
+        catch (Exception ex) { AppLog.Error(ex, "SEC B-02: некорректный путь бэкапа"); return; }
+
+        if (!PathSafety.IsSafeSubPath(canonicalBase, fullBackupPath))
+        {
+            AppLog.Error(null, "SEC B-02: BackupPath вне базовой папки: " + fullBackupPath);
+            return;
+        }
+        if (PathSafety.ContainsReparsePoint(fullBackupPath))
+        {
+            AppLog.Error(null, "SEC B-02: WipeOneAsync отменён — reparse point в пути");
+            return;
+        }
+
+        // Legacy safety: never touch executable/installation paths.
         try
         {
-            var fullPath = Path.GetFullPath(profile.BackupPath);
-            if (fullPath.Contains("SmartUsbBackup.exe", StringComparison.OrdinalIgnoreCase) ||
-                fullPath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            if (fullBackupPath.Contains("SmartUsbBackup.exe", StringComparison.OrdinalIgnoreCase) ||
+                fullBackupPath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             {
-                AppLog.Error(null, "Отказ удаления бэкапа: подозрительный путь (содержит .exe/установку): " + fullPath);
+                AppLog.Error(null, "Отказ удаления бэкапа: подозрительный путь: " + fullBackupPath);
                 return;
             }
         }

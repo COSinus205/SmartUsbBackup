@@ -286,6 +286,10 @@ internal sealed class NativeTrayIcon : IDisposable
 
     private IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
+        // SEC: G-01 / G-03 — защита от use-after-dispose и исключений native→managed.
+        if (_disposed) return DefWindowProc(hWnd, msg, wParam, lParam);
+        try
+        {
         if (msg == WM_TRAY)
         {
             int evt = (int)(lParam.ToInt64() & 0xFFFF);
@@ -313,6 +317,13 @@ internal sealed class NativeTrayIcon : IDisposable
         }
 
         return DefWindowProc(hWnd, msg, wParam, lParam);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, "[TRAY] Необработанное исключение в WndProc");
+            // SEC: G-01 — не возвращать 0, чтобы не ломать цепочку.
+            return DefWindowProc(hWnd, msg, wParam, lParam);
+        }
     }
 
     private NOTIFYICONDATA CreateData() => new()
