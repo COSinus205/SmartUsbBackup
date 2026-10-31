@@ -96,7 +96,7 @@
   <ItemGroup>
     <!-- Windows App SDK (стабильная ветка 1.6; при необходимости поменяйте версию) -->
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260921001" />
-    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4654" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2957" />
     <!-- Трей реализован собственным NativeTrayIcon (Shell_NotifyIcon + нативное меню):
          H.NotifyIcon 2.3.2 на WinUI 3 1.8 не доставлял клики по пунктам меню. -->
   </ItemGroup>
