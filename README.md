@@ -100,7 +100,7 @@ dotnet build SmartUsbBackup.WinUI.csproj -c Release -p:Platform=x64
 - TLS-pinning (доверяем стандартной проверке сертификатов Windows).
 - Authenticode-издатель (будет включено после получения сертификата).
 
-Сообщить об уязвимости: через GitHub Security Advisories (вкладка Security репозитория) или [TODO: указать email владельца].
+Сообщить об уязвимости: через GitHub Security Advisories (вкладка Security репозитория).
 
 ## Флешки без серийного номера
 
