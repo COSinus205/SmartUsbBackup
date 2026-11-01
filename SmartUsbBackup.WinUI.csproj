@@ -54,9 +54,9 @@
 
     <AssemblyName>SmartUsbBackup</AssemblyName>
     <RootNamespace>SmartUsbBackup</RootNamespace>
-    <Version>3.0.8</Version>
-    <FileVersion>3.0.8</FileVersion>
-    <AssemblyVersion>3.0.8</AssemblyVersion>
+    <Version>3.0.9</Version>
+    <FileVersion>3.0.9</FileVersion>
+    <AssemblyVersion>3.0.9</AssemblyVersion>
     <Company>Smart USB Backup</Company>
     <Product>Smart USB Backup</Product>
     <Description>Зеркальное резервное копирование USB-флешек (WinUI 3, событийная модель, 0% CPU в простое)</Description>

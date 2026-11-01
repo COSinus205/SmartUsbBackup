@@ -43,6 +43,7 @@ public static class UpdateService
         "github.com",
         "objects.githubusercontent.com",
         "github-releases.githubusercontent.com",
+        "release-assets.githubusercontent.com",
     };
 
     // Ровно один asset-установщик на релиз: SmartUsbBackup-Setup-<semver>.exe
@@ -115,15 +116,34 @@ public static class UpdateService
     public static bool IsAllowedDownloadUrl(string? url)
     {
         if (string.IsNullOrWhiteSpace(url))
+        {
+            AppLog.Warn("SEC A-03: URL пуст/whitespace — отклонено");
             return false;
+        }
+
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            AppLog.Warn($"SEC A-03: URL не является абсолютным URI — отклонено: {url}");
             return false;
+        }
+
         if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            AppLog.Warn($"SEC A-03: недопустимая схема '{uri.Scheme}' (ожидается https) — отклонено: {url}");
             return false;
+        }
+
         if (uri.IsDefaultPort == false && uri.Port != 443)
+        {
+            AppLog.Warn($"SEC A-03: недопустимый порт {uri.Port} (ожидается 443) — отклонено: {url}");
             return false;
+        }
+
         if (string.IsNullOrWhiteSpace(uri.Host))
+        {
+            AppLog.Warn($"SEC A-03: пустой хост — отклонено: {url}");
             return false;
+        }
 
         bool hostAllowed = false;
         foreach (var h in AllowedHosts)
@@ -135,15 +155,25 @@ public static class UpdateService
             }
         }
         if (!hostAllowed)
+        {
+            AppLog.Warn($"SEC A-03: хост '{uri.Host}' не в allowlist [{string.Join(", ", AllowedHosts)}] — отклонено: {url}");
             return false;
+        }
 
         if (uri.AbsolutePath.Contains("..", StringComparison.Ordinal))
+        {
+            AppLog.Warn($"SEC A-03: путь содержит '..' — отклонено: {url}");
             return false;
+        }
+
         if (string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase))
         {
             // Ожидаемый префикс для release-ассетов.
             if (!uri.AbsolutePath.StartsWith("/" + Repository + "/", StringComparison.OrdinalIgnoreCase))
+            {
+                AppLog.Warn($"SEC A-03: для github.com путь '{uri.AbsolutePath}' не начинается с '/{Repository}/' — отклонено: {url}");
                 return false;
+            }
         }
 
         return true;

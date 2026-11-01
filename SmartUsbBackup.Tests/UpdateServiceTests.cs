@@ -78,4 +78,16 @@ public class UpdateServiceTests
 
         File.Delete(file);
     }
+
+    [Theory]
+    [InlineData("https://release-assets.githubusercontent.com/github-production-release-asset/abc/SmartUsbBackup-Setup-3.0.8.exe", true)]
+    [InlineData("https://objects.githubusercontent.com/github-production-release-asset/abc/SmartUsbBackup-Setup-3.0.8.exe", true)]
+    [InlineData("https://github.com/COSinus205/SmartUsbBackup/releases/download/v3.0.8/SmartUsbBackup-Setup-3.0.8.exe", true)]
+    [InlineData("https://github.com/someone/OtherRepo/releases/download/v1/x.exe", false)]
+    [InlineData("https://evil.com/foo", false)]
+    [InlineData("http://github.com/COSinus205/SmartUsbBackup/foo", false)]
+    public void IsAllowedDownloadUrl_ValidateAllowlist(string url, bool expected)
+    {
+        Assert.Equal(expected, UpdateService.IsAllowedDownloadUrl(url));
+    }
 }
