@@ -33,13 +33,43 @@ public sealed class DriveProfile
     [JsonPropertyName("enabled")]
     public bool Enabled { get; set; } = false;
 
+    /// <summary>Последняя буква диска, под которой флешка была подключена (только runtime).</summary>
+    [JsonIgnore]
+    public char DriveLetter { get; set; } = '\0';
+
     /// <summary>Когда флешка впервые была видна приложению.</summary>
     [JsonPropertyName("firstSeen")]
     public DateTime FirstSeen { get; set; } = DateTime.Now;
 
     /// <summary>Полный путь к папке бэкапа (внутри базовой папки).</summary>
     [JsonIgnore]
-    public string BackupPath => Path.Combine(SettingsStore.Current.BaseBackupPath, FolderName);
+    public string BackupPath => Path.Combine(
+        string.IsNullOrWhiteSpace(BaseBackupPathOverride) ? SettingsStore.Current.BaseBackupPath : BaseBackupPathOverride!,
+        FolderName);
+
+    [JsonPropertyName("settingsTested")]
+    public bool SettingsTested { get; set; }
+
+    [JsonPropertyName("mirrorModeOverride")]
+    public bool? MirrorModeOverride { get; set; }
+
+    [JsonPropertyName("verifyByCrcOverride")]
+    public bool? VerifyByCrcOverride { get; set; }
+
+    [JsonPropertyName("skipHiddenSystemOverride")]
+    public bool? SkipHiddenSystemOverride { get; set; }
+
+    [JsonPropertyName("liveWatchOverride")]
+    public bool? LiveWatchOverride { get; set; }
+
+    [JsonPropertyName("bufferSizeKbOverride")]
+    public int? BufferSizeKbOverride { get; set; }
+
+    [JsonPropertyName("flushAfterFileOverride")]
+    public bool? FlushAfterFileOverride { get; set; }
+
+    [JsonPropertyName("baseBackupPathOverride")]
+    public string? BaseBackupPathOverride { get; set; }
 
     public override string ToString() => $"{Label} [{Serial}]";
 }
@@ -75,8 +105,20 @@ public sealed class AppSettings
     public bool StartMinimized { get; set; } = false;
 
     /// <summary>Инкрементальное копирование — игнорировать системные/скрытые файлы флешки.</summary>
+    [JsonPropertyName("defaultBufferSizeKb")]
+    public int DefaultBufferSizeKb { get; set; } = 4096;
+
+    [JsonPropertyName("defaultFlushAfterFile")]
+    public bool DefaultFlushAfterFile { get; set; } = true;
+
     [JsonPropertyName("skipHiddenSystem")]
     public bool SkipHiddenSystem { get; set; } = true;
+
+    [JsonPropertyName("autoTestNewDrives")]
+    public bool AutoTestNewDrives { get; set; } = true;
+
+    [JsonPropertyName("defaultEnabled")]
+    public bool DefaultEnabled { get; set; } = false;
 
     /// <summary>
     /// Мгновенная синхронизация изменений (FileSystemWatcher): если true —
@@ -90,6 +132,13 @@ public sealed class AppSettings
     /// <summary>Список известных флешек.</summary>
     [JsonPropertyName("drives")]
     public List<DriveProfile> Drives { get; set; } = new();
+
+    /// <summary>
+    /// Автоматическая проверка обновлений в фоне (раз в сутки).
+    /// false = не дергать сеть автоматически; ручная проверка из трея всегда доступна.
+    /// </summary>
+    [JsonPropertyName("autoCheckForUpdates")]
+    public bool AutoCheckForUpdates { get; set; } = true;
 
     /// <summary>Последний раз, когда мы проверяли обновления на GitHub.</summary>
     [JsonPropertyName("lastUpdateCheck")]
@@ -220,6 +269,7 @@ public static class SettingsStore
                     Serial = serial,
                     Label = string.IsNullOrWhiteSpace(label) ? "USB-накопитель" : label,
                     FolderName = BuildFolderName(label, serial),
+                    Enabled = Current.DefaultEnabled,
                 };
                 Current.Drives.Add(found);
                 Save();

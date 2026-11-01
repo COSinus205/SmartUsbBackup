@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -50,20 +51,48 @@ public sealed class BackupOrchestrator : IDisposable
     /// <summary>Сессии, живые прямо сейчас (флешка вставлена).</summary>
     public IReadOnlyCollection<ConnectedSession> ActiveSessions => (IReadOnlyCollection<ConnectedSession>)_sessions.Values;
 
+    /// <summary>Задачи полной синхронизации (для ожидания завершения при переносе бэкапа).</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, Task> SyncTasks => _syncTasks;
+
     // =====================================================================
     //  Реакция на системные события
     // =====================================================================
 
     /// <summary>Флешка подключилась.</summary>
-    public void OnDriveArrived(UsbDriveEventArgs e)
+    public async Task<DriveProfile> OnDriveArrivedAsync(UsbDriveEventArgs e, IProgress<SyncProgress>? progress = null)
     {
         // Профиль по серийному номеру (никогда не по букве диска).
         var profile = SettingsStore.GetOrCreate(e.Serial, e.VolumeLabel);
-        var session = new ConnectedSession(e.DriveLetter, profile, new FileSyncService(
-            SettingsStore.Current.MirrorMode,
-            SettingsStore.Current.VerifyByCrc,
-            SettingsStore.Current.SkipHiddenSystem));
+        profile.DriveLetter = e.DriveLetter;
 
+        // Авто-тест настроек при первом подключении (только чтение, безопасно).
+        if (SettingsStore.Current.AutoTestNewDrives && !profile.SettingsTested)
+        {
+            try
+            {
+                await RunDriveSettingsTest(profile, e.DriveLetter, progress);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error(ex, "Ошибка авто-теста настроек флешки");
+            }
+            profile.SettingsTested = true;
+            SettingsStore.Save();
+        }
+        else if (!profile.SettingsTested)
+        {
+            // Автотест выключен пользователем, считаем глобальные настройки подтверждёнными.
+            profile.SettingsTested = true;
+            SettingsStore.Save();
+        }
+
+        var session = new ConnectedSession(e.DriveLetter, profile, new FileSyncService(
+            profile.MirrorModeOverride ?? SettingsStore.Current.MirrorMode,
+            profile.VerifyByCrcOverride ?? SettingsStore.Current.VerifyByCrc,
+            profile.SkipHiddenSystemOverride ?? SettingsStore.Current.SkipHiddenSystem,
+            profile.BufferSizeKbOverride ?? SettingsStore.Current.DefaultBufferSizeKb,
+            profile.FlushAfterFileOverride ?? SettingsStore.Current.DefaultFlushAfterFile));
+ 
         session.FileWatcher.FileChanged += path => OnFileChanged(session, path);
         session.FileWatcher.FileDeleted += path => OnFileDeleted(session, path);
         // SEC: F-01 — при переполнении буфера FSW запускаем полную синхронизацию.
@@ -79,11 +108,105 @@ public sealed class BackupOrchestrator : IDisposable
         };
         _sessions[$"{e.DriveLetter}"] = session;
 
+        AppLog.Info($"Флешка подключена: {e.DriveLetter}: «{profile.Label}» serial={profile.Serial}, резервирование={(profile.Enabled ? "вкл" : "выкл")}");
+
         StateChanged?.Invoke();
+
+        string driveNameArrived = string.IsNullOrWhiteSpace(profile.Label) ? "USB" : (string.IsNullOrWhiteSpace(profile.Serial) ? profile.Label : $"{profile.Label} [{profile.Serial}]");
+        // UI: флешка подключается, метаданные ещё читаются.
+        ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Connecting) { DriveName = driveNameArrived });
 
         // Полная зеркальная синхронизация при подключении (только если профиль включён).
         if (profile.Enabled) StartFullSync(session);
         else AppLog.Info($"Флешка «{profile.Label}» подключена, но её резервирование выключено");
+
+        return profile;
+    }
+
+    /// <summary>
+    /// Безопасный тест настроек для новой флешки (только чтение, без записи).
+    /// Считает файлы и измеряет скорость чтения выборки, затем подбирает параметры.
+    /// Прогресс выводится через IProgress (в UI он попадает в прогресс-бар).
+    /// </summary>
+    private async Task RunDriveSettingsTest(DriveProfile profile, char letter, IProgress<SyncProgress>? progress)
+    {
+        string driveName = string.IsNullOrWhiteSpace(profile.Label) ? "USB" : profile.Label;
+        progress?.Report(new SyncProgress(letter, 0, 100, 0, 0, 0, 100, "", SyncPhase.Testing) { DriveName = driveName });
+
+        int fileCount = 0;
+        int sampleBytes = 0;
+        long freeBytes = 0;
+        long totalBytes = 0;
+        try
+        {
+            var di = new DriveInfo(letter + ":\\");
+            totalBytes = di.TotalSize;
+            freeBytes = di.AvailableFreeSpace;
+        }
+        catch { /* не критично */ }
+
+        var sw = Stopwatch.StartNew();
+        await Task.Run(() =>
+        {
+            try
+            {
+                var opts = new EnumerationOptions
+                {
+                    RecurseSubdirectories = true,
+                    IgnoreInaccessible = true,
+                    AttributesToSkip = FileAttributes.ReparsePoint,
+                };
+
+                foreach (var path in Directory.EnumerateFiles(letter + ":\\", "*", opts))
+                {
+                    if (fileCount >= 5000) break;
+                    fileCount++;
+                    try
+                    {
+                        if (sampleBytes < 16 * 1024 * 1024)
+                        {
+                            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.SequentialScan);
+                            var buf = new byte[64 * 1024];
+                            int read;
+                            while ((read = fs.Read(buf, 0, buf.Length)) > 0)
+                            {
+                                sampleBytes += read;
+                                if (sampleBytes >= 16 * 1024 * 1024) break;
+                            }
+                        }
+                    }
+                    catch { /* файл недоступен — пропускаем */ }
+
+                    if (fileCount % 500 == 0)
+                    {
+                        progress?.Report(new SyncProgress(letter, fileCount, Math.Max(fileCount, 1), 0, 0, 0, Math.Max(fileCount, 1), "", SyncPhase.Testing) { DriveName = driveName });
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLog.Warn("Тест чтения флешки прерван: " + ex.Message);
+            }
+        });
+        sw.Stop();
+
+        double mbps = sampleBytes > 0 ? sampleBytes / 1024.0 / 1024.0 / Math.Max(sw.Elapsed.TotalSeconds, 0.001) : 0;
+
+        // Глобальные значения используем как базу; тест уточняет только те поля,
+        // которые пользователь ещё не задавал явно (null).
+        profile.MirrorModeOverride ??= true;
+        profile.VerifyByCrcOverride ??= (mbps > 0 && mbps < 25);
+        profile.LiveWatchOverride ??= (fileCount < 3000);
+        profile.SkipHiddenSystemOverride ??= true;
+        profile.BufferSizeKbOverride ??= (mbps >= 60 ? 8192 : (mbps >= 20 ? 4096 : 1024));
+        profile.FlushAfterFileOverride ??= true;
+
+        AppLog.Info(
+            $"Тест флешки {profile.Label}: файлов={fileCount}, свободно={freeBytes / 1024 / 1024}MB, " +
+            $"скорость={mbps:F1}MB/s, CRC={(profile.VerifyByCrcOverride == true)}, " +
+            $"LiveWatch={(profile.LiveWatchOverride == true)}");
+
+        progress?.Report(new SyncProgress(letter, 100, 100, 0, 0, 0, 100, "", SyncPhase.Testing) { DriveName = driveName });
     }
 
     /// <summary>Флешка отсылается (извлекается).</summary>
@@ -99,6 +222,9 @@ public sealed class BackupOrchestrator : IDisposable
             cts.Dispose();
         }
         _syncTasks.TryRemove(key, out _);
+
+        string driveNameRemoved = string.IsNullOrWhiteSpace(session.Profile.Label) ? "USB" : (string.IsNullOrWhiteSpace(session.Profile.Serial) ? session.Profile.Label : $"{session.Profile.Label} [{session.Profile.Serial}]");
+        ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Idle) { DriveName = driveNameRemoved });
 
         try { session.Dispose(); }
         catch (Exception ex) { AppLog.Error(ex, "Ошибка освобождения сессии {letter}:"); }
@@ -118,10 +244,28 @@ public sealed class BackupOrchestrator : IDisposable
     {
         var key = session.Letter.ToString();
 
-        // Анти-дубль: если полный прогон уже идёт — не стартуем второй.
+        // Анти-дубль: если полный прогон уже идёт для этой же сессии — не стартуем второй.
+        // Раньше старая/отменённая запись могла «залипнуть» в словаре и блокировать
+        // повторный запуск после выдёргивания/вставки флешки: прогресс-бар тогда
+        // не возвращался. Теперь чужую/устаревшую запись снимаем и отменяем.
         lock (_fullSyncs)
         {
-            if (_fullSyncs.ContainsKey(key)) return;
+            if (_fullSyncs.TryGetValue(key, out var existingCts))
+            {
+                if (existingCts == session.CurrentCts)
+                {
+                    AppLog.Info($"Полная синхронизация {key}: уже запущена для этой сессии — пропуск");
+                    return; // уже запущено для этой же сессии
+                }
+
+                AppLog.Warn($"Полная синхронизация {key}: снята устаревшая запись (сессия сменилась)");
+                try { existingCts.Cancel(); }
+                catch { /* мог уже быть disposed */ }
+                try { existingCts.Dispose(); }
+                catch { }
+                _fullSyncs.TryRemove(key, out _);
+            }
+
             var cts = new CancellationTokenSource();
             session.CurrentCts = cts;
             _fullSyncs[key] = cts;
@@ -129,8 +273,14 @@ public sealed class BackupOrchestrator : IDisposable
 
         session.State = SessionState.Syncing;
 
+        string driveNameSync = string.IsNullOrWhiteSpace(session.Profile.Label) ? "USB" : (string.IsNullOrWhiteSpace(session.Profile.Serial) ? session.Profile.Label : $"{session.Profile.Label} [{session.Profile.Serial}]");
+
+        AppLog.Info($"Полная синхронизация {key} запущена: {driveNameSync}");
+        // UI: начало полной синхронизации (обход/подсчёт), даже до первого progress.Report.
+        ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Scanning) { DriveName = driveNameSync });
+
         // IProgress<SyncProgress> маршалит вызовы в UI-поток (SynchronizationContext).
-        var progress = new Progress<SyncProgress>(p => ProgressChanged?.Invoke(session, p));
+        var progress = new Progress<SyncProgress>(p => ProgressChanged?.Invoke(session, p with { DriveName = driveNameSync }));
 
         // Копия «уходит» в пул потоков: интерфейс и обработка USB-событий не пустеют.
         var task = Task.Run(async () =>
@@ -144,17 +294,26 @@ public sealed class BackupOrchestrator : IDisposable
                 session.State = result.Error is null ? SessionState.Idle : SessionState.Error;
                 session.LastResult = result.Error ?? $"копий {result.Copied}, удалено {result.Deleted}, пропущено {result.Skipped}";
                 SyncFinished?.Invoke(session, result);
+
+                // После успешного завершения переходим в режим ожидания изменений, если он включён.
+                if (result.Error is null && SettingsStore.Current.LiveWatch)
+                {
+                    ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.LiveWatch) { DriveName = driveNameSync });
+                }
             }
             catch (OperationCanceledException)
             {
+                AppLog.Warn($"Полная синхронизация {key} отменена");
                 session.State = SessionState.Idle;
                 session.LastResult = "отменено";
+                ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Cancelled) { DriveName = driveNameSync });
             }
             catch (Exception ex)
             {
                 session.State = SessionState.Error;
                 session.LastResult = "ошибка: " + ex.Message;
                 AppLog.Error(ex, $"Полная синхронизация {session.SourceRoot} сорвалась");
+                ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Error) { DriveName = driveNameSync });
             }
             finally
             {
@@ -214,18 +373,32 @@ public sealed class BackupOrchestrator : IDisposable
 
     private async void OnFileChanged(ConnectedSession session, string fullPath)
     {
-        if (!session.Profile.Enabled) return;
-        // Мгновенная синхронизация опциональна (по умолчанию выключена): без неё
-        // файлы синхронизируются только при подключении флешки или по кнопке.
-        if (!SettingsStore.Current.LiveWatch) return;
-        await session.FsSync.SyncSingleFileAsync(fullPath, session.SourceRoot, session.BackupPath);
+        try
+        {
+            if (!session.Profile.Enabled) return;
+            // Мгновенная синхронизация опциональна (по умолчанию выключена): без неё
+            // файлы синхронизируются только при подключении флешки или по кнопке.
+            if (!SettingsStore.Current.LiveWatch) return;
+            await session.FsSync.SyncSingleFileAsync(fullPath, session.SourceRoot, session.BackupPath);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, "Ошибка при инкрементальном копировании файла");
+        }
     }
 
     private void OnFileDeleted(ConnectedSession session, string fullPath)
     {
-        if (!session.Profile.Enabled) return;
-        if (!SettingsStore.Current.LiveWatch) return;
-        session.FsSync.DeleteFromBackup(fullPath, session.SourceRoot, session.BackupPath);
+        try
+        {
+            if (!session.Profile.Enabled) return;
+            if (!SettingsStore.Current.LiveWatch) return;
+            session.FsSync.DeleteFromBackup(fullPath, session.SourceRoot, session.BackupPath);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, "Ошибка при удалении файла из бэкапа");
+        }
     }
 
     // =====================================================================
@@ -261,7 +434,20 @@ public sealed class BackupOrchestrator : IDisposable
         try
         {
             if (Directory.Exists(canonicalBase))
-                Directory.Delete(canonicalBase, recursive: true);
+            {
+                foreach (var file in Directory.EnumerateFiles(canonicalBase, "*", SearchOption.AllDirectories))
+                {
+                    try { System.IO.File.Delete(file); }
+                    catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить файл: " + file); }
+                }
+                foreach (var dir in Directory.EnumerateDirectories(canonicalBase, "*", SearchOption.AllDirectories).OrderByDescending(d => d.Length))
+                {
+                    try { Directory.Delete(dir, recursive: false); }
+                    catch { /* папка занята или недоступна */ }
+                }
+                try { Directory.Delete(canonicalBase, recursive: false); }
+                catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить корневую папку бэкапов"); }
+            }
             SettingsStore.Current.Drives.Clear();
             SettingsStore.Save();
             AppLog.Info("Все бэкапы и настройки удалены");
@@ -279,7 +465,7 @@ public sealed class BackupOrchestrator : IDisposable
     ///   • Профиль флешки НЕ удаляем: строка остаётся в таблице (раньше подключённая
     ///     флешка исчезала из интерфейса до переподключения), просто выключаем её.
     /// </summary>
-    public async Task WipeOneAsync(DriveProfile profile)
+    public async Task WipeOneAsync(DriveProfile profile, IProgress<SyncProgress>? progress = null)
     {
         // SEC: B-02/D-01 — каноническая проверка базы и принадлежности BackupPath.
         var canonicalBase = PathSafety.CanonicalizeBase(SettingsStore.Current.BaseBackupPath);
@@ -347,17 +533,95 @@ public sealed class BackupOrchestrator : IDisposable
             session.LastResult = "бэкап удалён";
         }
 
+        char driveLetter = session?.Letter ?? '?';
+        string driveNameWipe = string.IsNullOrWhiteSpace(profile.Label) ? "USB" : (string.IsNullOrWhiteSpace(profile.Serial) ? profile.Label : $"{profile.Label} [{profile.Serial}]");
+
+        AppLog.Info($"Удаление бэкапа начато: {profile.BackupPath}");
+
         try
         {
-            if (Directory.Exists(profile.BackupPath))
-                Directory.Delete(profile.BackupPath, recursive: true);
-            AppLog.Info($"Бэкап флешки удалён: {profile.BackupPath}");
+            // Удаление потенциально большого числа файлов не блокирует UI-поток:
+            // I/O и отчёты прогресса выполняются в фоне; IProgress сам маршалит в UI.
+            await Task.Run(() =>
+            {
+                List<string> files = new();
+                int totalFiles = 0;
+                if (Directory.Exists(profile.BackupPath))
+                {
+                    try
+                    {
+                        files = Directory.EnumerateFiles(profile.BackupPath, "*", SearchOption.AllDirectories).ToList();
+                        totalFiles = files.Count;
+                    }
+                    catch (Exception ex) { AppLog.Error(ex, "Не удалось перечислить файлы бэкапа"); }
+                }
+
+                int done = 0;
+                progress?.Report(new SyncProgress(driveLetter, 0, totalFiles, 0, 0, 0, totalFiles, "", SyncPhase.Wipe) { DriveName = driveNameWipe });
+
+                if (Directory.Exists(profile.BackupPath) && files.Count > 0)
+                {
+                    foreach (var file in files)
+                    {
+                        try
+                        {
+                            System.IO.File.Delete(file);
+                            done++;
+                            progress?.Report(new SyncProgress(driveLetter, done, totalFiles, 0, 0, done, totalFiles, "", SyncPhase.Wipe) { DriveName = driveNameWipe });
+                        }
+                        catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить файл: " + file); }
+                    }
+
+                    var dirs = Directory.EnumerateDirectories(profile.BackupPath, "*", SearchOption.AllDirectories)
+                        .OrderByDescending(d => d.Length).ToList();
+                    foreach (var dir in dirs)
+                    {
+                        try { Directory.Delete(dir, recursive: false); }
+                        catch { /* папка занята или недоступна */ }
+                    }
+                    try { Directory.Delete(profile.BackupPath, recursive: false); }
+                    catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить папку бэкапа"); }
+                }
+
+                if (totalFiles == 0)
+                {
+                    progress?.Report(new SyncProgress(driveLetter, 1, 1, 0, 0, 1, 1, "", SyncPhase.Wipe) { DriveName = driveNameWipe });
+                }
+
+                AppLog.Info($"Бэкап флешки удалён: {profile.BackupPath}");
+            }).ConfigureAwait(false);
         }
-        catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить папку бэкапа"); }
+        catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить бэкап флешки"); }
 
         profile.Enabled = false;
         SettingsStore.Save();
         StateChanged?.Invoke();
+    }
+
+    public async Task TestDriveSettingsAsync(DriveProfile profile, IProgress<SyncProgress>? progress, bool resetOverrides = true)
+    {
+        if (resetOverrides)
+        {
+            profile.MirrorModeOverride = null;
+            profile.VerifyByCrcOverride = null;
+            profile.SkipHiddenSystemOverride = null;
+            profile.LiveWatchOverride = null;
+            profile.BufferSizeKbOverride = null;
+            profile.FlushAfterFileOverride = null;
+            profile.SettingsTested = false;
+        }
+        try
+        {
+            await RunDriveSettingsTest(profile, profile.DriveLetter, progress);
+            profile.SettingsTested = true;
+            SettingsStore.Save();
+        }
+        catch
+        {
+            profile.SettingsTested = false;
+            SettingsStore.Save();
+            throw;
+        }
     }
 
     public async Task DisposeAsync()
@@ -432,7 +696,7 @@ public sealed class ConnectedSession : IDisposable
     public string SourceRoot => $@"{Letter}:\";
 
     /// <summary>Папка, в которую пишется копия.</summary>
-    public string BackupPath => Path.Combine(SettingsStore.Current.BaseBackupPath, Profile.FolderName);
+    public string BackupPath => Profile.BackupPath;
 
     public ConnectedSession(char letter, DriveProfile profile, FileSyncService fsSync)
     {

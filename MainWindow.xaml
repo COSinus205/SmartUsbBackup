@@ -107,21 +107,23 @@
           </Grid.RowDefinitions>
 
           <ProgressBar
-              x:Name="ProgressSync"
+              x:Name="GlobalProgressBar"
               Grid.Row="0"
-              Maximum="100"
               Value="0"
               IsIndeterminate="False"
+               Height="12"
+               CornerRadius="8"
+               Background="{ThemeResource ControlFillColorDefaultBrush}"
               HorizontalAlignment="Stretch" />
 
           <TextBlock
-              x:Name="TxtStatus"
+              x:Name="TxtGlobalStatus"
               Grid.Row="1"
               HorizontalAlignment="Stretch"
               MaxLines="2"
               TextTrimming="CharacterEllipsis"
               TextWrapping="Wrap"
-              Text="Ожидание флешки…" />
+              Text="" />
         </Grid>
 
         <!-- ==================== ROW 4: Список флешек ==================== -->
@@ -164,6 +166,8 @@
                 Grid.Row="1"
                 SelectionChanged="OnListSelectionChanged"
                 DoubleTapped="OnListDoubleTapped"
+                ScrollViewer.VerticalScrollMode="Enabled"
+                ScrollViewer.VerticalScrollBarVisibility="Auto"
                 ScrollViewer.HorizontalScrollMode="Disabled"
                 ScrollViewer.HorizontalScrollBarVisibility="Disabled">
 
@@ -243,14 +247,32 @@
     </TabViewItem>
 
     <TabViewItem Header="Настройки" IsClosable="False">
-      <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0">
+      <ScrollViewer VerticalScrollBarVisibility="Auto" VerticalScrollMode="Enabled" Padding="0">
         <StackPanel Padding="24,20,24,24" Spacing="12">
           <TextBlock Text="Глобальные настройки" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,8" />
 
           <CheckBox x:Name="ChkMirror"   Content="Зеркало"             Checked="OnMirrorChecked"   Unchecked="OnMirrorUnchecked" />
           <CheckBox x:Name="ChkCrc"      Content="Проверять CRC32"     Checked="OnCrcChecked"      Unchecked="OnCrcUnchecked" />
+          <CheckBox x:Name="ChkSkipHidden" Content="Пропускать скрытые/системные" Checked="OnSkipHiddenChecked" Unchecked="OnSkipHiddenUnchecked" ToolTipService.ToolTip="Влияет на то, какие файлы флешки включаются в синхронизацию." />
           <CheckBox x:Name="ChkStartup"  Content="Запускать с Windows" Checked="OnStartupChecked"  Unchecked="OnStartupUnchecked" />
           <CheckBox x:Name="ChkLiveWatch" Content="Обновлять сразу (watch)" Checked="OnLiveChecked" Unchecked="OnLiveUnchecked" ToolTipService.ToolTip="Если включено — изменения на флешке сразу копируются." />
+          <CheckBox x:Name="ChkAutoUpdate" Content="Автообновление приложения" Checked="OnAutoUpdateChecked" Unchecked="OnAutoUpdateUnchecked" />
+          <CheckBox x:Name="ChkAutoTestNewDrives" Content="Тестировать новую флешку при первом подключении" Checked="OnAutoTestChecked" Unchecked="OnAutoTestUnchecked" ToolTipService.ToolTip="Запускает безопасный тест чтения перед синхронизацией и подбирает настройки для этой флешки." />
+          <CheckBox x:Name="ChkDefaultEnabled" Content="Активировать новые флешки автоматически" Checked="OnDefaultEnabledChecked" Unchecked="OnDefaultEnabledUnchecked" ToolTipService.ToolTip="Если включено — при первом подключении флешка сразу начинает резервироваться." />
+
+          <TextBlock Text="Папка хранения бэкапов (глобальная):" Margin="0,8,0,0" />
+          <TextBox x:Name="TxtSettingsBackupPath" IsReadOnly="True" Text="" />
+          <Button Content="Выбрать папку хранения..." Click="OnSettingsBrowseClicked" />
+
+          <TextBlock Text="Размер буфера по умолчанию, КБ:" Margin="0,8,0,0" />
+          <ComboBox x:Name="CmbDefaultBuffer" Width="120" SelectionChanged="OnDefaultBufferChanged">
+            <ComboBoxItem Content="1024" />
+            <ComboBoxItem Content="4096" />
+            <ComboBoxItem Content="8192" />
+          </ComboBox>
+          <CheckBox x:Name="ChkDefaultFlush" Content="Flush после файла (надёжно)" Checked="OnDefaultFlushChecked" Unchecked="OnDefaultFlushUnchecked" ToolTipService.ToolTip="Принудительно сбрасывать записанные данные на флешку после каждого файла." />
+
+          <TextBlock Text="Стандарты для новых флешек: флешка при первом подключении получает указанные выше настройки; затем они могут быть уточнены тестом и сохранены индивидуально." TextWrapping="Wrap" Opacity="0.8" Margin="0,8,0,0" />
         </StackPanel>
       </ScrollViewer>
     </TabViewItem>

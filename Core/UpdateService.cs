@@ -17,7 +17,11 @@ namespace SmartUsbBackup.Core;
 /// Всё, что нужно знать о новом релизе на GitHub: версия, ссылка на скачивание,
 /// размер ассета, хеш (если предоставлен GitHub).
 /// </summary>
-public sealed record UpdateInfo(Version Version, string Tag, string DownloadUrl, long Size, string AssetName, string? Sha256);
+public sealed record UpdateInfo(Version Version, string Tag, string DownloadUrl, long Size, string AssetName, string? Sha256)
+{
+    /// <summary>Ссылка на страницу релиза на GitHub (html_url из API). Используется для ручного скачивания мажорных версий.</summary>
+    public string? HtmlUrl { get; set; }
+}
 
 /// <summary>
 /// Проверка обновлений раз в сутки + скачивание и запуск инсталлятора.
@@ -216,6 +220,33 @@ public static class UpdateService
         }
     }
 
+    /// <summary>
+    /// Возвращает true, если удалённая версия имеет больший мажорный номер.
+    /// Invalid/неопознанные версии не блокируют стандартное обновление (false).
+    /// </summary>
+    public static bool IsMajorUpdate(Version? current, Version? remote)
+    {
+        if (current is null || remote is null)
+            return false;
+        return remote.Major > current.Major;
+    }
+
+    /// <summary>Строковая обёртка (для непроверенных тегов/CLI и тестов). При невалидном вводе — false, без исключений.</summary>
+    public static bool IsMajorUpdate(string? current, string? remote)
+    {
+        if (!Version.TryParse((current ?? string.Empty).TrimStart('v', 'V'), out var currentVersion))
+        {
+            AppLog.Warn("SEC A-???: невалидная текущая версия при сравнении мажорных: " + current);
+            return false;
+        }
+        if (!Version.TryParse((remote ?? string.Empty).TrimStart('v', 'V'), out var remoteVersion))
+        {
+            AppLog.Warn("SEC A-???: невалидная удалённая версия при сравнении мажорных: " + remote);
+            return false;
+        }
+        return IsMajorUpdate(currentVersion, remoteVersion);
+    }
+
     public static async Task<UpdateInfo?> CheckAsync(CancellationToken ct = default)
     {
         try
@@ -228,6 +259,10 @@ public static class UpdateService
             using var stream = await resp.Content.ReadAsStreamAsync(ct);
             using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
             var root = doc.RootElement;
+
+            string? htmlUrl = null;
+            if (root.TryGetProperty("html_url", out var htmlUrlProp))
+                htmlUrl = htmlUrlProp.GetString();
 
             var tag = root.GetProperty("tag_name").GetString() ?? "";
             if (!Version.TryParse(tag.TrimStart('v', 'V'), out var version))
@@ -316,7 +351,7 @@ public static class UpdateService
                 AppLog.Warn("SEC A-02: в ответе API отсутствует SHA-256 для asset'а " + assetName + " — обновление помечено как непроверенное");
             }
 
-            return new UpdateInfo(version, tag, url!, size, assetName, sha256);
+            return new UpdateInfo(version, tag, url!, size, assetName, sha256) { HtmlUrl = htmlUrl };
         }
         catch (Exception)
         {

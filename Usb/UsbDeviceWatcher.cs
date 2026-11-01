@@ -57,6 +57,15 @@ public sealed class UsbDeviceWatcher
         // SEC: G-01 — исключения на границе native→managed не должны ронять процесс.
         try
         {
+            // Окно WinUI 3 может терять прокрутку колеса при subclassing'е.
+            // Для wheel-сообщений отдаём управление DefWindowProc.
+            if (msg == 0x020A || msg == 0x020E) // WM_MOUSEWHEEL / WM_MOUSEHWHEEL
+            {
+                int delta = (short)(wParam.ToInt64() >> 16);
+                MainWindow.HandleMouseWheel(delta);
+                return IntPtr.Zero;
+            }
+
             if (IsRestoreMessage(msg))
             {
                 RestoreRequested?.Invoke();
@@ -120,15 +129,22 @@ public sealed class UsbDeviceWatcher
     {
         _ = Task.Run(() =>
         {
-            var info = QueryDrive(letter, retry: 3, delayMs: 200);
-            if (info is not null)
+            try
             {
-                AppLog.Info($"WM_DEVICECHANGE: ARRIVAL {letter}: «{info!.Value.VolumeLabel}» serial={info.Value.Serial}");
-                DriveArrived?.Invoke(new UsbDriveEventArgs(letter, info.Value.VolumeLabel, info.Value.Serial));
+                var info = QueryDrive(letter, retry: 3, delayMs: 200);
+                if (info is not null)
+                {
+                    AppLog.Info($"WM_DEVICECHANGE: ARRIVAL {letter}: «{info!.Value.VolumeLabel}» serial={info.Value.Serial}");
+                    DriveArrived?.Invoke(new UsbDriveEventArgs(letter, info.Value.VolumeLabel, info.Value.Serial));
+                }
+                else
+                {
+                    AppLog.Warn($"WM_DEVICECHANGE: ARRIVAL {letter}: том не смонтировался вовремя");
+                }
             }
-            else
+            catch (Exception ex)
             {
-                AppLog.Warn($"WM_DEVICECHANGE: ARRIVAL {letter}: том не смонтировался вовремя");
+                AppLog.Error(ex, $"WM_DEVICECHANGE: ошибка обработки подключения {letter}:");
             }
         });
     }

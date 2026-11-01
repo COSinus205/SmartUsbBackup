@@ -53,6 +53,12 @@ public sealed partial class MainWindow : Window
     private NativeTrayIcon? _tray;
     private bool _checkingUpdate;
 
+    public static MainWindow? Instance;
+    public static DispatcherQueue? UiDispatcher;
+    private readonly HashSet<DriveProfile> _syncingDrives = new();
+    private readonly HashSet<DriveProfile> _deletingDrives = new();
+    private readonly object _driveStateLock = new();
+
 
     public MainWindow(bool startHidden)
     {
@@ -81,6 +87,8 @@ public sealed partial class MainWindow : Window
         }
 
         _dq = DispatcherQueue.GetForCurrentThread();
+        Instance = this;
+        UiDispatcher = _dq;
         _hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         _appWindow = this.AppWindow;
 
@@ -94,7 +102,7 @@ public sealed partial class MainWindow : Window
         _tray.OpenRequested += () => { _ = _dq.TryEnqueue(RestoreWindow); };
         _tray.ToggleRequested += () => { _ = _dq.TryEnqueue(ToggleWindow); };
         _tray.ExitRequested += ExitFromTray;
-        _tray.UpdateRequested += () => { _ = _dq.TryEnqueue(() => CheckForUpdatesAsync(true)); };
+        _tray.UpdateRequested += () => { _dq.TryEnqueue(() => _ = SafeFireAndForget(CheckForUpdatesAsync(true))); };
         UpdateTrayText();
 
         // Все Click/Checked/Unchecked-обработчики подключены в XAML (атрибуты Click=...).
@@ -105,7 +113,20 @@ public sealed partial class MainWindow : Window
         // события ставят ТУ ЖЕ самое значение, harmless).
         ChkMirror.IsChecked = SettingsStore.Current.MirrorMode;
         ChkCrc.IsChecked = SettingsStore.Current.VerifyByCrc;
+        ChkSkipHidden.IsChecked = SettingsStore.Current.SkipHiddenSystem;
         ChkLiveWatch.IsChecked = SettingsStore.Current.LiveWatch;
+        ChkAutoUpdate.IsChecked = SettingsStore.Current.AutoCheckForUpdates;
+        ChkAutoTestNewDrives.IsChecked = SettingsStore.Current.AutoTestNewDrives;
+        ChkDefaultEnabled.IsChecked = SettingsStore.Current.DefaultEnabled;
+
+        ChkDefaultFlush.IsChecked = SettingsStore.Current.DefaultFlushAfterFile;
+        CmbDefaultBuffer.SelectedIndex = SettingsStore.Current.DefaultBufferSizeKb switch
+        {
+            1024 => 0,
+            8192 => 2,
+            _ => 1,
+        };
+        TxtSettingsBackupPath.Text = SettingsStore.Current.BaseBackupPath;
     RefreshStartupCheckboxFromRegistry();
         TxtBackupPath.Text = SettingsStore.Current.BaseBackupPath;
 
@@ -189,7 +210,7 @@ public sealed partial class MainWindow : Window
         ApplyTitleBarInsets();
 
         // Авто-проверка обновлений раз в сутки (разработчик может запретить её в настройках).
-        _ = Task.Delay(8000).ContinueWith(_ => _dq.TryEnqueue(() => CheckForUpdatesAsync(false)));
+        _ = Task.Delay(8000).ContinueWith(_ => _dq.TryEnqueue(() => _ = SafeFireAndForget(CheckForUpdatesAsync(false))));
     }
 
     /// <summary>
@@ -312,8 +333,38 @@ public sealed partial class MainWindow : Window
 
     private void HookOrchestrator()
     {
-        _orchestrator.ProgressChanged += (_, p) => _dq.TryEnqueue(() => OnProgress(p));
+        _orchestrator.ProgressChanged += (session, p) =>
+        {
+            bool changed = UpdateSyncingState(session.Profile, p.Phase);
+            _dq.TryEnqueue(() =>
+            {
+                if (changed) RefreshList();
+                OnProgress(p with { DriveLetter = session.Letter });
+            });
+        };
         _orchestrator.StateChanged += () => _dq.TryEnqueue(RefreshList);
+    }
+
+    private bool UpdateSyncingState(DriveProfile profile, SyncPhase phase)
+    {
+        bool isSyncingPhase = phase is SyncPhase.Scanning or SyncPhase.Copying or SyncPhase.Pruning;
+        lock (_driveStateLock)
+        {
+            if (isSyncingPhase)
+                return _syncingDrives.Add(profile);
+            return _syncingDrives.Remove(profile);
+        }
+    }
+
+    private void CleanupDriveState(char letter)
+    {
+        var profile = _orchestrator.ActiveSessions.FirstOrDefault(s => s.Letter == letter)?.Profile;
+        if (profile is null) return;
+        lock (_driveStateLock)
+        {
+            _syncingDrives.Remove(profile);
+            _deletingDrives.Remove(profile);
+        }
     }
 
     private void HookUsb()
@@ -328,16 +379,17 @@ public sealed partial class MainWindow : Window
         _usbWatcher.Attach(_hwnd);
     }
 
-    private void OnDriveArrivedUi(UsbDriveEventArgs e)
+    private async void OnDriveArrivedUi(UsbDriveEventArgs e)
     {
-        _orchestrator.OnDriveArrived(e);
+        var progress = new Progress<SyncProgress>(p => OnProgress(p));
+
+        var profile = await _orchestrator.OnDriveArrivedAsync(e, progress);
+
         RefreshList();
 
         // Новая флешка по умолчанию НЕ резервируется — подсказываем, что делать.
-        var profile = SettingsStore.Current.Drives
-            .FirstOrDefault(d => string.Equals(d.Serial, e.Serial, StringComparison.OrdinalIgnoreCase));
         if (profile is not null && !profile.Enabled)
-            TxtStatus.Text = $"Флешка «{e.VolumeLabel}» добавлена. Поставьте галочку «Активна», чтобы начать резервирование.";
+            TxtGlobalStatus.Text = $"Флешка «{e.VolumeLabel}» добавлена. Поставьте галочку «Активна», чтобы начать резервирование.";
 
         if (IsWindowHidden()) // (только если окно скрыто — иначе пользователь всё видит)
             SafeNotify("Smart USB Backup",
@@ -346,7 +398,16 @@ public sealed partial class MainWindow : Window
 
     private void OnDriveRemovedUi(char letter)
     {
+        var removedProfile = _orchestrator.ActiveSessions.FirstOrDefault(s => s.Letter == letter)?.Profile;
         _orchestrator.OnDriveRemoved(letter);
+        if (removedProfile is not null)
+        {
+            lock (_driveStateLock)
+            {
+                _syncingDrives.Remove(removedProfile);
+                _deletingDrives.Remove(removedProfile);
+            }
+        }
         RefreshList();
 
         ResetProgressIfIdle();
@@ -373,12 +434,19 @@ public sealed partial class MainWindow : Window
     {
         _ = Task.Run(() =>
         {
-            foreach (var drive in DriveInfo.GetDrives()
-                         .Where(d => d.DriveType == DriveType.Removable && d.IsReady))
+            try
             {
-                var q = UsbDeviceWatcher.QueryDrive(drive.Name[0], retry: 1, delayMs: 0);
-                if (q is not null)
-                    _usbWatcher.RaiseArrived(drive.Name[0], q.Value.VolumeLabel, q.Value.Serial);
+                foreach (var drive in DriveInfo.GetDrives()
+                             .Where(d => d.DriveType == DriveType.Removable && d.IsReady))
+                {
+                    var q = UsbDeviceWatcher.QueryDrive(drive.Name[0], retry: 1, delayMs: 0);
+                    if (q is not null)
+                        _usbWatcher.RaiseArrived(drive.Name[0], q.Value.VolumeLabel, q.Value.Serial);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error(ex, "Ошибка первичного обхода вставленных флешек");
             }
         });
 
@@ -442,9 +510,40 @@ public sealed partial class MainWindow : Window
             "Удалить");
         if (!ok) return;
 
-        await _orchestrator.WipeOneAsync(row.Profile);
+        var profile = row.Profile;
+
+        lock (_driveStateLock) { _deletingDrives.Add(profile); }
         RefreshList();
-        ResetProgressIfIdle();
+
+        var progress = new Progress<SyncProgress>(p => OnProgress(p));
+
+        try
+        {
+            await _orchestrator.WipeOneAsync(profile, progress);
+        }
+        finally
+        {
+            lock (_driveStateLock) { _deletingDrives.Remove(profile); }
+            await Task.Yield();
+            ShowIdle();
+            RefreshList();
+        }
+    }
+
+    /// <summary>Удаление всех бэкапов (используется внешними сценариями, например деинсталлятором).</summary>
+    private void WipeAllBackups()
+    {
+        ShowWipeAll();
+        RefreshList();
+        try
+        {
+            _orchestrator.WipeEverything();
+        }
+        finally
+        {
+            ShowIdle();
+            RefreshList();
+        }
     }
 
     // ---------- Настройки-чекбоксы ----------
@@ -456,6 +555,48 @@ public sealed partial class MainWindow : Window
     private void OnCrcUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.VerifyByCrc = false);
     private void OnLiveChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.LiveWatch = true);
     private void OnLiveUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.LiveWatch = false);
+    private void OnSkipHiddenChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.SkipHiddenSystem = true);
+    private void OnSkipHiddenUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.SkipHiddenSystem = false);
+    private void OnAutoTestChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.AutoTestNewDrives = true);
+    private void OnAutoTestUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.AutoTestNewDrives = false);
+
+    private void OnDefaultBufferChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (CmbDefaultBuffer.SelectedIndex < 0) return;
+        int kb = CmbDefaultBuffer.SelectedIndex switch { 0 => 1024, 2 => 8192, _ => 4096 };
+        SaveSetting(s => s.DefaultBufferSizeKb = kb);
+    }
+
+    private void OnDefaultFlushChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultFlushAfterFile = true);
+    private void OnDefaultFlushUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultFlushAfterFile = false);
+
+    private void OnDefaultEnabledChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultEnabled = true);
+    private void OnDefaultEnabledUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultEnabled = false);
+
+    private async void OnSettingsBrowseClicked(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var picker = new FolderPicker { SuggestedStartLocation = PickerLocationId.DocumentsLibrary };
+            picker.FileTypeFilter.Add("*");
+            WinRT.Interop.InitializeWithWindow.Initialize(picker, _hwnd);
+            var folder = await picker.PickSingleFolderAsync();
+            if (folder is null) return;
+
+            SettingsStore.Current.BaseBackupPath = Path.GetFullPath(folder.Path);
+            SettingsStore.Save();
+            TxtSettingsBackupPath.Text = SettingsStore.Current.BaseBackupPath;
+            TxtBackupPath.Text = SettingsStore.Current.BaseBackupPath;
+            RefreshList();
+            AppLog.Info("Глобальная папка хранения бэкапов изменена: " + SettingsStore.Current.BaseBackupPath);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, "Не удалось выбрать папку хранения бэкапов");
+        }
+    }
+    private void OnAutoUpdateChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.AutoCheckForUpdates = true);
+    private void OnAutoUpdateUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.AutoCheckForUpdates = false);
 
     private void OnStartupChecked(object sender, RoutedEventArgs e) => ToggleStartup(enable: true);
     private void OnStartupUnchecked(object sender, RoutedEventArgs e) => ToggleStartup(enable: false);
@@ -542,29 +683,391 @@ public sealed partial class MainWindow : Window
             }
         }
 
+        var profile = row.Profile;
+
+        var statusText = new TextBlock
+        {
+            Text = BuildDriveStatusText(profile),
+            TextWrapping = TextWrapping.Wrap,
+        };
+
+        var chkEnabled = CreateLabeledCheckBox("Активна (резервировать)", profile.Enabled);
+        chkEnabled.Checked += (_, _) =>
+        {
+            profile.Enabled = true;
+            SettingsStore.Save();
+            AppLog.Info($"Резервирование «{profile.Label}» → true");
+            foreach (var s in _orchestrator.ActiveSessions)
+                if (ReferenceEquals(s.Profile, profile)) _orchestrator.SyncOne(profile);
+            RefreshList();
+            statusText.Text = BuildDriveStatusText(profile);
+        };
+        chkEnabled.Unchecked += (_, _) =>
+        {
+            profile.Enabled = false;
+            SettingsStore.Save();
+            _orchestrator.CancelSync(profile);
+            ResetProgressIfIdle();
+            AppLog.Info($"Резервирование «{profile.Label}» → false");
+            RefreshList();
+            statusText.Text = BuildDriveStatusText(profile);
+        };
+
+        var chkMirror = CreateLabeledCheckBox("Зеркало", profile.MirrorModeOverride ?? SettingsStore.Current.MirrorMode);
+        chkMirror.Checked += (_, _) => { profile.MirrorModeOverride = true; SettingsStore.Save(); };
+        chkMirror.Unchecked += (_, _) => { profile.MirrorModeOverride = false; SettingsStore.Save(); };
+
+        var chkCrc = CreateLabeledCheckBox("Проверять CRC32", profile.VerifyByCrcOverride ?? SettingsStore.Current.VerifyByCrc);
+        chkCrc.Checked += (_, _) => { profile.VerifyByCrcOverride = true; SettingsStore.Save(); };
+        chkCrc.Unchecked += (_, _) => { profile.VerifyByCrcOverride = false; SettingsStore.Save(); };
+
+        var chkHidden = CreateLabeledCheckBox("Пропускать скрытые/системные", profile.SkipHiddenSystemOverride ?? SettingsStore.Current.SkipHiddenSystem);
+        chkHidden.Checked += (_, _) => { profile.SkipHiddenSystemOverride = true; SettingsStore.Save(); };
+        chkHidden.Unchecked += (_, _) => { profile.SkipHiddenSystemOverride = false; SettingsStore.Save(); };
+
+        var chkLive = CreateLabeledCheckBox("Обновлять сразу (watch)", profile.LiveWatchOverride ?? SettingsStore.Current.LiveWatch);
+        chkLive.Checked += (_, _) => { profile.LiveWatchOverride = true; SettingsStore.Save(); };
+        chkLive.Unchecked += (_, _) => { profile.LiveWatchOverride = false; SettingsStore.Save(); };
+
+        var bufferLabel = new TextBlock { Text = "Размер буфера, КБ:" };
+        var cmbBuffer = new ComboBox { Width = 120 };
+        cmbBuffer.Items.Add(new ComboBoxItem { Content = "по стандарту" });
+        cmbBuffer.Items.Add(new ComboBoxItem { Content = "1024" });
+        cmbBuffer.Items.Add(new ComboBoxItem { Content = "4096" });
+        cmbBuffer.Items.Add(new ComboBoxItem { Content = "8192" });
+        cmbBuffer.SelectedIndex = profile.BufferSizeKbOverride switch
+        {
+            null => 0,
+            1024 => 1,
+            4096 => 2,
+            8192 => 3,
+            _ => (profile.BufferSizeKbOverride < 2048 ? 1 : (profile.BufferSizeKbOverride < 6144 ? 2 : 3)),
+        };
+        cmbBuffer.SelectionChanged += (_, _) =>
+        {
+            profile.BufferSizeKbOverride = cmbBuffer.SelectedIndex switch
+            {
+                1 => 1024,
+                2 => 4096,
+                3 => 8192,
+                _ => null,
+            };
+            SettingsStore.Save();
+        };
+
+        var chkFlush = CreateLabeledCheckBox("Flush после файла (надёжно)", profile.FlushAfterFileOverride ?? SettingsStore.Current.DefaultFlushAfterFile);
+        chkFlush.Checked += (_, _) => { profile.FlushAfterFileOverride = true; SettingsStore.Save(); };
+        chkFlush.Unchecked += (_, _) => { profile.FlushAfterFileOverride = false; SettingsStore.Save(); };
+
+        var testedText = new TextBlock
+        {
+            Text = $"Настройки протестированы: {(profile.SettingsTested ? "да" : "нет")}",
+            Opacity = 0.8,
+        };
+
+        var btnTest = new Button
+        {
+            Content = "Тестировать эту флешку",
+            HorizontalAlignment = HorizontalAlignment.Left,
+            Margin = new Thickness(0, 8, 0, 0),
+        };
+        btnTest.Click += async (_, _) =>
+        {
+            btnTest.IsEnabled = false;
+            TxtGlobalStatus.Text = $"Тестирование «{profile.Label}»...";
+            try
+            {
+                if (!Directory.Exists(profile.DriveLetter + ":\\"))
+                {
+                    TxtGlobalStatus.Text = "Флешка не подключена — тест невозможен.";
+                    return;
+                }
+
+                profile.MirrorModeOverride = null;
+                profile.VerifyByCrcOverride = null;
+                profile.SkipHiddenSystemOverride = null;
+                profile.LiveWatchOverride = null;
+                profile.SettingsTested = false;
+
+                var progress = new Progress<SyncProgress>(p => OnProgress(p));
+                await _orchestrator.TestDriveSettingsAsync(profile, progress, false);
+
+                chkMirror.IsChecked = profile.MirrorModeOverride ?? SettingsStore.Current.MirrorMode;
+                chkCrc.IsChecked = profile.VerifyByCrcOverride ?? SettingsStore.Current.VerifyByCrc;
+                chkHidden.IsChecked = profile.SkipHiddenSystemOverride ?? SettingsStore.Current.SkipHiddenSystem;
+                chkLive.IsChecked = profile.LiveWatchOverride ?? SettingsStore.Current.LiveWatch;
+                cmbBuffer.SelectedIndex = profile.BufferSizeKbOverride switch
+                {
+                    null => 0,
+                    1024 => 1,
+                    4096 => 2,
+                    8192 => 3,
+                    _ => (profile.BufferSizeKbOverride < 2048 ? 1 : (profile.BufferSizeKbOverride < 6144 ? 2 : 3)),
+                };
+                chkFlush.IsChecked = profile.FlushAfterFileOverride ?? SettingsStore.Current.DefaultFlushAfterFile;
+
+                testedText.Text = $"Настройки протестированы: {(profile.SettingsTested ? "да" : "нет")}";
+                statusText.Text = BuildDriveStatusText(profile);
+                TxtGlobalStatus.Text = $"Тест флешки «{profile.Label}» завершён.";
+                RefreshList();
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error(ex, "Ошибка ручного теста флешки");
+                TxtGlobalStatus.Text = "Ошибка теста: " + ex.Message;
+            }
+            finally
+            {
+                btnTest.IsEnabled = true;
+                await Task.Yield();
+                ShowIdle();
+            }
+        };
+
+        var backupPathText = new TextBlock
+        {
+            Text = $"Папка хранения: {profile.BackupPath}",
+            TextWrapping = TextWrapping.Wrap,
+        };
+
+        var btnRelocateBackup = new Button { Content = "Изменить папку хранения..." };
+        var btnResetBackupPath = new Button { Content = "Сбросить папку хранения к стандартной" };
+        btnRelocateBackup.Click += async (_, _) =>
+        {
+            try
+            {
+                var picker = new FolderPicker { SuggestedStartLocation = PickerLocationId.DocumentsLibrary };
+                picker.FileTypeFilter.Add("*");
+                WinRT.Interop.InitializeWithWindow.Initialize(picker, _hwnd);
+                var folder = await picker.PickSingleFolderAsync();
+                if (folder is null) return;
+                await RelocateDriveBackupAsync(profile, folder.Path, new Progress<SyncProgress>(p => OnProgress(p)));
+                backupPathText.Text = $"Папка хранения: {profile.BackupPath}";
+                statusText.Text = BuildDriveStatusText(profile);
+                TxtGlobalStatus.Text = $"Папка хранения «{profile.Label}» изменена.";
+                RefreshList();
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error(ex, "Ошибка изменения папки хранения флешки");
+                TxtGlobalStatus.Text = "Ошибка: " + ex.Message;
+            }
+            finally { await Task.Yield(); ShowIdle(); }
+        };
+        btnResetBackupPath.Click += async (_, _) =>
+        {
+            try
+            {
+                await RelocateDriveBackupAsync(profile, SettingsStore.Current.BaseBackupPath, new Progress<SyncProgress>(p => OnProgress(p)));
+                backupPathText.Text = $"Папка хранения: {profile.BackupPath}";
+                statusText.Text = BuildDriveStatusText(profile);
+                TxtGlobalStatus.Text = $"Папка хранения «{profile.Label}» сброшена к стандартной.";
+                RefreshList();
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error(ex, "Ошибка сброса папки хранения флешки");
+                TxtGlobalStatus.Text = "Ошибка: " + ex.Message;
+            }
+            finally { await Task.Yield(); ShowIdle(); }
+        };
+
+        var btnResetSettings = new Button { Content = "Сбросить настройки к стандартным" };
+        btnResetSettings.Click += (_, _) =>
+        {
+            profile.MirrorModeOverride = null;
+            profile.VerifyByCrcOverride = null;
+            profile.SkipHiddenSystemOverride = null;
+            profile.LiveWatchOverride = null;
+            profile.BufferSizeKbOverride = null;
+            profile.FlushAfterFileOverride = null;
+            profile.SettingsTested = false;
+            SettingsStore.Save();
+
+            chkMirror.IsChecked = SettingsStore.Current.MirrorMode;
+            chkCrc.IsChecked = SettingsStore.Current.VerifyByCrc;
+            chkHidden.IsChecked = SettingsStore.Current.SkipHiddenSystem;
+            chkLive.IsChecked = SettingsStore.Current.LiveWatch;
+            cmbBuffer.SelectedIndex = SettingsStore.Current.DefaultBufferSizeKb switch
+            {
+                1024 => 0,
+                8192 => 2,
+                _ => 1,
+            };
+            chkFlush.IsChecked = SettingsStore.Current.DefaultFlushAfterFile;
+            testedText.Text = "Настройки протестированы: нет";
+            statusText.Text = BuildDriveStatusText(profile);
+            TxtGlobalStatus.Text = $"Настройки «{profile.Label}» сброшены к стандартным.";
+            RefreshList();
+        };
+
+        var stack = new StackPanel { Spacing = 10 };
+        stack.Children.Add(new TextBlock
+        {
+            Text = $"{row.Name} — {profile.Serial}",
+            FontSize = 18,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+        });
+        stack.Children.Add(backupPathText);
+        stack.Children.Add(new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            Children = { btnRelocateBackup, btnResetBackupPath },
+        });
+        stack.Children.Add(statusText);
+        stack.Children.Add(chkEnabled);
+        stack.Children.Add(chkMirror);
+        stack.Children.Add(chkCrc);
+        stack.Children.Add(chkHidden);
+        stack.Children.Add(chkLive);
+        stack.Children.Add(bufferLabel);
+        stack.Children.Add(cmbBuffer);
+        stack.Children.Add(chkFlush);
+        stack.Children.Add(testedText);
+        stack.Children.Add(btnTest);
+        stack.Children.Add(btnResetSettings);
+
+        var rootGrid = new Grid { Padding = new Thickness(16) };
+        rootGrid.Children.Add(new ScrollViewer { Content = stack });
+
         var tab = new TabViewItem
         {
             Header = row.Name,
             IsClosable = true,
             Tag = driveId,
-            Content = new Grid
-            {
-                Padding = new Thickness(16),
-                Children =
-                {
-                    new TextBlock
-                    {
-                        Text = "Настройки в разработке",
-                        HorizontalAlignment = HorizontalAlignment.Center,
-                        VerticalAlignment = VerticalAlignment.Center,
-                        FontSize = 18
-                    }
-                }
-            }
+            Content = rootGrid,
         };
 
         MainTabView.TabItems.Add(tab);
         MainTabView.SelectedItem = tab;
+    }
+
+    private async Task RelocateDriveBackupAsync(DriveProfile profile, string newBase, IProgress<SyncProgress> progress)
+    {
+        newBase = Path.GetFullPath(newBase);
+        string oldPath = profile.BackupPath;
+        string oldBase = string.IsNullOrWhiteSpace(profile.BaseBackupPathOverride) ? SettingsStore.Current.BaseBackupPath : profile.BaseBackupPathOverride!;
+
+        if (string.Equals(oldBase, newBase, StringComparison.OrdinalIgnoreCase))
+        {
+            progress.Report(new SyncProgress(profile.DriveLetter, 1, 1, 0, 0, 0, 1, "", SyncPhase.Moving) { DriveName = profile.Label });
+            TxtGlobalStatus.Text = "Папка хранения уже стандартная (или не изменилась).";
+            return;
+        }
+
+        // Останавливаем активную синхронизацию этой флешки, чтобы не писать во время переноса.
+        var session = _orchestrator.ActiveSessions.FirstOrDefault(s =>
+            ReferenceEquals(s.Profile, profile) ||
+            string.Equals(s.Profile.Serial, profile.Serial, StringComparison.OrdinalIgnoreCase));
+        if (session is not null)
+        {
+            session.CurrentCts?.Cancel();
+            var key = session.Letter.ToString();
+            if (_orchestrator.SyncTasks.TryGetValue(key, out var running))
+                await Task.WhenAny(running, Task.Delay(5000)).ConfigureAwait(false);
+        }
+
+        string newPath = Path.Combine(newBase, profile.FolderName);
+        progress.Report(new SyncProgress(profile.DriveLetter, 0, 1, 0, 0, 0, 1, "", SyncPhase.Moving) { DriveName = profile.Label });
+
+        if (Directory.Exists(oldPath))
+        {
+            await Task.Run(() => MoveDirectoryTree(oldPath, newPath));
+        }
+
+        // Обновляем хранилище (null = стандартный глобальный путь).
+        profile.BaseBackupPathOverride = string.Equals(newBase, SettingsStore.Current.BaseBackupPath, StringComparison.OrdinalIgnoreCase)
+            ? null
+            : newBase;
+        SettingsStore.Save();
+
+        progress.Report(new SyncProgress(profile.DriveLetter, 1, 1, 0, 0, 0, 1, "", SyncPhase.Moving) { DriveName = profile.Label });
+        AppLog.Info($"Папка хранения флешки «{profile.Label}» перенесена: {oldPath} -> {newPath}");
+    }
+
+    private static void MoveDirectoryTree(string source, string destination)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+
+        if (!Directory.Exists(destination))
+        {
+            try
+            {
+                Directory.Move(source, destination);
+                return;
+            }
+            catch (IOException)
+            {
+                // Кросс-томовый перенос: копируем + удаляем исходное.
+            }
+        }
+
+        if (!Directory.Exists(destination))
+            Directory.CreateDirectory(destination);
+
+        foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
+        {
+            var rel = Path.GetRelativePath(source, file);
+            var target = Path.Combine(destination, rel);
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            File.Copy(file, target, true);
+        }
+
+        foreach (var dir in Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories)
+                                     .OrderByDescending(d => d.Length))
+        {
+            try { if (!Directory.EnumerateFileSystemEntries(dir).Any()) Directory.Delete(dir); } catch { }
+        }
+        try { Directory.Delete(source, recursive: true); } catch { /* уже очищено */ }
+    }
+
+    private static string BuildDriveStatusText(DriveProfile profile)
+        => $"Активна: {(profile.Enabled ? "да" : "нет")}; протестировано: {(profile.SettingsTested ? "да" : "нет")}";
+
+    private static CheckBox CreateLabeledCheckBox(string content, bool isChecked)
+        => new CheckBox { Content = content, IsChecked = isChecked };
+
+    private static ScrollViewer? FindDescendantScrollViewer(DependencyObject root)
+    {
+        if (root is ScrollViewer sv) return sv;
+        int count = VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < count; i++)
+        {
+            var found = FindDescendantScrollViewer(VisualTreeHelper.GetChild(root, i));
+            if (found is not null) return found;
+        }
+        return null;
+    }
+
+    public static void HandleMouseWheel(int delta)
+    {
+        var instance = Instance;
+        var dq = UiDispatcher;
+        if (instance is null || dq is null) return;
+
+        dq.TryEnqueue(() =>
+        {
+            try
+            {
+                var tab = instance.MainTabView.SelectedItem as TabViewItem;
+                var content = tab?.Content as FrameworkElement ?? instance.MainTabView as FrameworkElement;
+                if (content is null) return;
+
+                var viewer = FindDescendantScrollViewer(content);
+                if (viewer is null) return;
+
+                double step = Math.Sign(delta) * 48.0;
+                double target = viewer.VerticalOffset - step;
+                if (target < 0) target = 0;
+                if (target > viewer.ScrollableHeight) target = viewer.ScrollableHeight;
+                viewer.ChangeView(null, target, null);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error(ex, "Ошибка ручной прокрутки колесом мыши");
+            }
+        });
     }
 
 
@@ -641,8 +1144,35 @@ public sealed partial class MainWindow : Window
 
 
             row.Enabled = profile.Enabled;
-            row.RefreshState(ComputeState(profile));
-            row.BackupState = HasBackup(profile.BackupPath);
+
+            bool isConnected = false;
+            if (profile.DriveLetter != '\0')
+                isConnected = System.IO.Directory.Exists(profile.DriveLetter + ":\\");
+            row.RefreshState(isConnected ? "Включено" : "Выключено");
+
+            if (!isConnected)
+            {
+                lock (_driveStateLock)
+                {
+                    if (_syncingDrives.Contains(profile)) _syncingDrives.Remove(profile);
+                    if (_deletingDrives.Contains(profile)) _deletingDrives.Remove(profile);
+                }
+
+                row.BackupState = Directory.Exists(profile.BackupPath) ? "Есть сохранение" : "Нет сохранения";
+            }
+            else
+            {
+                bool deleting, syncing;
+                lock (_driveStateLock)
+                {
+                    deleting = _deletingDrives.Contains(profile);
+                    syncing = _syncingDrives.Contains(profile);
+                }
+                if (deleting) row.BackupState = "Удаляется";
+                else if (syncing) row.BackupState = "Синхронизируется";
+                else if (Directory.Exists(profile.BackupPath)) row.BackupState = "Есть сохранение";
+                else row.BackupState = "Нет сохранения";
+            }
         }
 
         // 3) выделение могло исчезнуть вместе со строкой
@@ -685,18 +1215,67 @@ public sealed partial class MainWindow : Window
         };
     }
 
+    private string ComputeBackupState(DriveProfile profile)
+    {
+        if (!Directory.Exists(profile.BackupPath)) return "Нет сохранения";
+
+        bool syncing = _orchestrator.ActiveSessions.Any(s =>
+            (ReferenceEquals(s.Profile, profile) ||
+             string.Equals(s.Profile.Serial, profile.Serial, StringComparison.OrdinalIgnoreCase))
+            && s.State == SessionState.Syncing);
+
+        return syncing ? "Синхронизируется" : "Есть сохранение";
+    }
+
     /// <summary>
-    /// Вернуть прогресс в исходное «Ожидание флешки…», если ни одна флешка
-    /// сейчас не копируется (после отмены, удаления бэкапа или извлечения).
+    /// Вернуть прогресс в исходное состояние при отсутствии активной синхронизации.
     /// </summary>
+    private void ShowIdle()
+    {
+        GlobalProgressBar.IsIndeterminate = false;
+        GlobalProgressBar.Value = 0;
+        TxtGlobalStatus.Text = "";
+    }
+
+    private void ShowScanning(string drive, int count)
+    {
+        GlobalProgressBar.IsIndeterminate = true;
+        TxtGlobalStatus.Text = $"Сканирование [{drive}]: Файлов: {count}";
+    }
+
+    private void ShowCopying(string drive, int total, int copied, int skipped, string file, int percent)
+    {
+        GlobalProgressBar.IsIndeterminate = false;
+        GlobalProgressBar.Value = Math.Clamp(percent, 0, 100);
+        TxtGlobalStatus.Text = $"Копирование [{drive}]: Всего: {total} | Скопировано: {copied} | Пропущено: {skipped} | {System.IO.Path.GetFileName(file)}";
+    }
+
+    private void ShowPruning(string drive)
+    {
+        GlobalProgressBar.IsIndeterminate = true;
+        TxtGlobalStatus.Text = "Очистка...";
+    }
+
+    private void ShowWipe(string drive)
+    {
+        GlobalProgressBar.IsIndeterminate = true;
+        TxtGlobalStatus.Text = $"Удаление бэкапа [{drive}]...";
+    }
+
+    private void ShowWipeAll()
+    {
+        GlobalProgressBar.IsIndeterminate = true;
+        TxtGlobalStatus.Text = "Удаление всех бэкапов...";
+    }
+
     private void ResetProgressIfIdle()
     {
         if (_orchestrator.ActiveSessions.Any(s => s.State == SessionState.Syncing))
             return;
 
-        ProgressSync.IsIndeterminate = false;
-        ProgressSync.Value = 0;
-        TxtStatus.Text = "Ожидание флешки…";
+        GlobalProgressBar.IsIndeterminate = false;
+        GlobalProgressBar.Value = 0;
+        TxtGlobalStatus.Text = "";
     }
 
 
@@ -717,6 +1296,18 @@ public sealed partial class MainWindow : Window
     //  АВТО-ОБНОВЛЕНИЕ с GitHub Releases
     // =====================================================================
 
+    private async Task SafeFireAndForget(Task task)
+    {
+        try
+        {
+            await task;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, "Ошибка в фоновой задаче (SafeFireAndForget)");
+        }
+    }
+
     /// <summary>
     /// Проверить наличие новой версии. В фоне вызывается раз в сутки,
     /// вручную — по пункту в трее «Проверить обновления».
@@ -727,6 +1318,12 @@ public sealed partial class MainWindow : Window
         _checkingUpdate = true;
         try
         {
+            if (!userInitiated && !SettingsStore.Current.AutoCheckForUpdates)
+            {
+                AppLog.Info("Автообновление отключено в настройках, фоновая проверка пропущена.");
+                return;
+            }
+
             var now = DateTime.Now;
             var last = SettingsStore.Current.LastUpdateCheck;
             if (!userInitiated && (now - last).TotalHours < 24)
@@ -745,10 +1342,45 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
-            if (info.Version <= current)
+            if (info.Version < current)
+            {
+                if (userInitiated)
+                    await ShowInfoAsync("Обновления", "У вас более новая версия, обновление не требуется.");
+                return;
+            }
+            if (info.Version == current)
             {
                 if (userInitiated)
                     await ShowInfoAsync("Обновления", $"Установлена самая свежая версия ({current}).");
+                return;
+            }
+
+            // Мажорные обновления (например 4.x -> 5.x) не скачиваем автоматически —
+            // возможные breaking changes. Пользователь качает установщик вручную.
+            if (UpdateService.IsMajorUpdate(current, info.Version))
+            {
+                var majorDlg = new ContentDialog
+                {
+                    Title = "Доступна мажорная версия",
+                    Content = $"Доступна мажорная версия {info.Version}. Автоматическое обновление недоступно из-за возможных breaking changes. Пожалуйста, скачайте установщик вручную.",
+                    PrimaryButtonText = "Открыть страницу релиза",
+                    CloseButtonText = "Отмена",
+                    DefaultButton = ContentDialogButton.Primary,
+                    XamlRoot = Content.XamlRoot,
+                };
+
+                if (await majorDlg.ShowAsync() == ContentDialogResult.Primary &&
+                    !string.IsNullOrWhiteSpace(info.HtmlUrl))
+                {
+                    try
+                    {
+                        Process.Start(new ProcessStartInfo(info.HtmlUrl) { UseShellExecute = true });
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLog.Error(ex, "Не удалось открыть страницу релиза");
+                    }
+                }
                 return;
             }
 
@@ -825,42 +1457,93 @@ public sealed partial class MainWindow : Window
     private void OnProgress(SyncProgress p)
     {
         // ≤5 перерисовок/с (минимальная CPU-нагрузка), НО финальный статус — всегда.
-        bool isFinal = p.Phase is SyncPhase.Done or SyncPhase.Error;
-        if (!isFinal && Stopwatch.GetTimestamp() - _lastProgressPaint < Stopwatch.Frequency / 5)
+        // Смена фазы (сканирование/подключение/live-watch) не троттлим: иначе сразу
+        // после выдёргивания флешки прогресс-бар может «не вернуться».
+        bool isFinal = p.Phase is SyncPhase.Completed or SyncPhase.Error or SyncPhase.Cancelled or SyncPhase.Idle or SyncPhase.Wipe;
+        bool isStateChange = p.Phase is SyncPhase.Scanning or SyncPhase.Connecting or SyncPhase.LiveWatch;
+        if (!isFinal && !isStateChange && Stopwatch.GetTimestamp() - _lastProgressPaint < Stopwatch.Frequency / 5)
             return;
         _lastProgressPaint = Stopwatch.GetTimestamp();
 
+        var drive = string.IsNullOrWhiteSpace(p.DriveName) ? p.DriveLetter.ToString().Trim() : p.DriveName;
+
         switch (p.Phase)
         {
+            case SyncPhase.Testing:
+                GlobalProgressBar.Visibility = Visibility.Visible;
+                GlobalProgressBar.IsIndeterminate = true;
+                GlobalProgressBar.Maximum = 100;
+                GlobalProgressBar.Value = 0;
+                TxtGlobalStatus.Text = $"Тестирование {drive}";
+                break;
+
             case SyncPhase.Scanning:
-                ProgressSync.IsIndeterminate = true;
-                TxtStatus.Text = "Сканирование флешки…";
+                GlobalProgressBar.Visibility = Visibility.Visible;
+                GlobalProgressBar.IsIndeterminate = true;
+                GlobalProgressBar.Maximum = 100;
+                GlobalProgressBar.Value = 0;
+                TxtGlobalStatus.Text = $"Сканирование {drive}";
                 break;
 
             case SyncPhase.Copying:
-                ProgressSync.IsIndeterminate = false;
-                ProgressSync.Value = Math.Clamp(p.BytesDone * 100.0 / Math.Max(1, p.TotalBytes), 0, 100);
-                TxtStatus.Text =
-                    $"({p.CurrentFile} / {p.TotalFiles}, {p.BytesDone / 1048576.0:F1} МБ) {p.CurrentPath}";
+                GlobalProgressBar.Visibility = Visibility.Visible;
+                GlobalProgressBar.IsIndeterminate = false;
+                GlobalProgressBar.Maximum = p.TotalFiles > 0 ? p.TotalFiles : 1;
+                GlobalProgressBar.Value = p.ProcessedCount;
+                TxtGlobalStatus.Text = $"Копирование {drive}: {System.IO.Path.GetFileName(p.CurrentFile)}";
                 break;
 
             case SyncPhase.Pruning:
-                ProgressSync.IsIndeterminate = true;
-                TxtStatus.Text = "Режим «Зеркало»: очистка бэкапа…";
+                GlobalProgressBar.Visibility = Visibility.Visible;
+                GlobalProgressBar.IsIndeterminate = false;
+                GlobalProgressBar.Maximum = p.TotalFiles > 0 ? p.TotalFiles : 1;
+                GlobalProgressBar.Value = p.ProcessedCount;
+                TxtGlobalStatus.Text = $"Очистка {drive}";
                 break;
 
+            case SyncPhase.Moving:
+                GlobalProgressBar.Visibility = Visibility.Visible;
+                GlobalProgressBar.IsIndeterminate = true;
+                TxtGlobalStatus.Text = $"Перенос бэкапа {drive}";
+                break;
+
+            case SyncPhase.Wipe:
+                GlobalProgressBar.Visibility = Visibility.Visible;
+                GlobalProgressBar.IsIndeterminate = false;
+                GlobalProgressBar.Maximum = p.TotalFiles > 0 ? p.TotalFiles : 1;
+                GlobalProgressBar.Value = p.ProcessedCount;
+                TxtGlobalStatus.Text = $"Удаление бэкапа {drive}";
+                break;
+
+            case SyncPhase.LiveWatch:
+                CleanupDriveState(p.DriveLetter);
+                GlobalProgressBar.Visibility = Visibility.Visible;
+                GlobalProgressBar.IsIndeterminate = false;
+                GlobalProgressBar.Maximum = 100;
+                GlobalProgressBar.Value = 100;
+                TxtGlobalStatus.Text = "Слежение за изменениями (Ожидание)";
+                RefreshList();
+                break;
+
+            case SyncPhase.Connecting:
+                GlobalProgressBar.Visibility = Visibility.Visible;
+                GlobalProgressBar.IsIndeterminate = false;
+                GlobalProgressBar.Maximum = 100;
+                GlobalProgressBar.Value = 0;
+                TxtGlobalStatus.Text = "";
+                break;
+
+            case SyncPhase.Cancelled:
             case SyncPhase.Error:
-                ProgressSync.IsIndeterminate = false;
-                ProgressSync.Value = 0;
-                TxtStatus.Text = "Ошибка: " + p.CurrentPath;
-                break;
-
-            default: // Done
-                ProgressSync.IsIndeterminate = false;
-                ProgressSync.Value = 100;
-                TxtStatus.Text = string.IsNullOrEmpty(p.CurrentPath)
-                    ? "Готово"
-                    : "Готово. Последний файл: " + p.CurrentPath;
+            case SyncPhase.Idle:
+            default: // Completed
+                CleanupDriveState(p.DriveLetter);
+                GlobalProgressBar.Visibility = Visibility.Visible;
+                GlobalProgressBar.IsIndeterminate = false;
+                GlobalProgressBar.Maximum = 100;
+                GlobalProgressBar.Value = 0;
+                TxtGlobalStatus.Text = "";
+                RefreshList();
                 break;
         }
     }

@@ -80,6 +80,18 @@ public class UpdateServiceTests
     }
 
     [Theory]
+    [InlineData("4.0.0", "5.0.0", true)]
+    [InlineData("4.0.0", "4.1.0", false)]
+    [InlineData("4.0.0", "4.0.1", false)]
+    [InlineData("4.1.0", "4.0.0", false)]
+    [InlineData("5.0.0", "4.9.9", false)]
+    [InlineData("abc", "5.0.0", false)]
+    public void IsMajorUpdate_Works(string current, string remote, bool expected)
+    {
+        Assert.Equal(expected, UpdateService.IsMajorUpdate(current, remote));
+    }
+
+    [Theory]
     [InlineData("https://release-assets.githubusercontent.com/github-production-release-asset/abc/SmartUsbBackup-Setup-3.0.8.exe", true)]
     [InlineData("https://objects.githubusercontent.com/github-production-release-asset/abc/SmartUsbBackup-Setup-3.0.8.exe", true)]
     [InlineData("https://github.com/COSinus205/SmartUsbBackup/releases/download/v3.0.8/SmartUsbBackup-Setup-3.0.8.exe", true)]

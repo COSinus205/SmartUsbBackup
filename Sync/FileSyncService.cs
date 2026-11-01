@@ -12,21 +12,40 @@ namespace SmartUsbBackup.Sync;
 /// <summary>Фаза синхронизации — для отображения в прогресс-баре.</summary>
 public enum SyncPhase
 {
+    Idle,       // ничего не происходит
+    Connecting, // подключение/чтение метаданных флешки
     Scanning,   // строим список файлов (быстро: ничего не читаем напрямую)
     Copying,    // копируем глубину
     Pruning,    // «зеркало»: удаляем файлы, исчезнувшие на флешке
-    Done,
-    Error,
+    Wipe,       // удаление бэкапа флешки
+    Moving,     // перенос бэкапа флешки в другую папку
+    LiveWatch,  // ожидание изменений в фоне (live watch)
+    Testing,    // однократный тест настроек при первом подключении (только чтение)
+    Cancelled,  // пользователь/система отменили операцию
+    Completed,  // синхронизация завершена успешно
+    Error,      // произошла ошибка
 }
 
-/// <summary>Сообщение о прогрессе: (текущий_файл / всего_файлов, размер), путь к файлу.</summary>
+/// <summary>Сообщение о прогрессе одной операции синхронизации.</summary>
 public sealed record SyncProgress(
-    int CurrentFile,
+    char DriveLetter,
+    int ProcessedCount,
     int TotalFiles,
+    int Copied,
+    int Skipped,
     long BytesDone,
     long TotalBytes,
-    string CurrentPath,
-    SyncPhase Phase);
+    string CurrentFile,
+    SyncPhase Phase)
+{
+    /// <summary>Отображаемое имя флешки («Метка [серийник]»).</summary>
+    public string DriveName { get; init; } = "";
+
+    /// <summary>Процент выполнения по байтам (0..100).</summary>
+    public int Percent => TotalBytes > 0
+        ? (int)Math.Clamp(BytesDone * 100.0 / TotalBytes, 0, 100)
+        : (TotalFiles > 0 && ProcessedCount >= TotalFiles ? 100 : 0);
+}
 
 /// <summary>Итог одного прогона синхронизации.</summary>
 public sealed record SyncResult(int Copied, int Deleted, int Skipped, long BytesCopied, string? Error);
@@ -57,12 +76,19 @@ public sealed class FileSyncService
     private readonly bool _mirror;
     private readonly bool _verifyByCrc;
     private readonly bool _skipHiddenSystem;
+    private readonly int _bufferSize;
+    private readonly bool _flushAfterFile;
 
-    public FileSyncService(bool mirror, bool verifyByCrc, bool skipHiddenSystem)
+    /// <summary>Кэш метаданных файла (избегаем повторного FileInfo в цикле копирования).</summary>
+    private readonly record struct FileMeta(string Path, long Size, DateTime LastWriteUtc);
+
+    public FileSyncService(bool mirror, bool verifyByCrc, bool skipHiddenSystem, int bufferSizeKb = 4096, bool flushAfterFile = true)
     {
         _mirror = mirror;
         _verifyByCrc = verifyByCrc;
         _skipHiddenSystem = skipHiddenSystem;
+        _bufferSize = Math.Clamp(bufferSizeKb * 1024, 64 * 1024, 8 * 1024 * 1024);
+        _flushAfterFile = flushAfterFile;
     }
 
     // =====================================================================
@@ -80,7 +106,7 @@ public sealed class FileSyncService
         if (!Directory.Exists(sourceDir))
             return new SyncResult(0, 0, 0, 0, "Флешка отключена");
 
-        List<string> sourceFiles;
+        List<FileMeta> sourceFiles;
         long totalBytes;
         try
         {
@@ -88,7 +114,7 @@ public sealed class FileSyncService
             totalBytes = 0;
             foreach (var f in sourceFiles)
             {
-                try { totalBytes += new FileInfo(f).Length; } catch { /*гонка с FS*/ }
+                totalBytes += f.Size;
             }
         }
         catch (Exception ex)
@@ -104,7 +130,11 @@ public sealed class FileSyncService
         // Индекс приёмной стороны для O(1)-сравнения по относительному пути.
         var targetIndex = BuildTargetIndex(targetDir);
 
-        progress?.Report(new SyncProgress(0, sourceFiles.Count, 0, totalBytes, "", SyncPhase.Scanning));
+        progress?.Report(new SyncProgress('\0', 0, sourceFiles.Count, 0, 0, 0, totalBytes, "", SyncPhase.Scanning));
+
+        // Троттлинг UI-прогресса: лимит 1 отчёт на 100 мс или при сдвиге на 1%.
+        var progressStopwatch = Stopwatch.StartNew();
+        int lastReportedPercent = 0;
 
         for (int i = 0; i < sourceFiles.Count; i++)
         {
@@ -118,14 +148,14 @@ public sealed class FileSyncService
                 return new SyncResult(copied, 0, skipped, bytesCopied, "Флешка отключена");
             }
 
-            var srcPath = sourceFiles[i];
+            var srcMeta = sourceFiles[i];
+            var srcPath = srcMeta.Path;
             try
             {
                 var rel = Path.GetRelativePath(sourceDir, srcPath);
                 var dstPath = Path.Combine(targetDir, rel);
 
-                var srcFi = new FileInfo(srcPath);
-                var srcKey = new FileKey(srcFi.Length, srcFi.LastWriteTimeUtc);
+                var srcKey = new FileKey(srcMeta.Size, srcMeta.LastWriteUtc);
 
                 var dstKey = targetIndex.TryGetValue(rel, out var k) ? (FileKey?)k : null;
 
@@ -144,15 +174,36 @@ public sealed class FileSyncService
                     await CopyChunkedAsync(srcPath, dstPath, ct);
                     // Сохраняем метаданные: иначе на следующем запуске mtime целевого файла
                     // будет «сейчас» и инкрементальное сравнение всегда будет считать файл новым.
-                    System.IO.File.SetLastWriteTimeUtc(dstPath, srcFi.LastWriteTimeUtc);
-                    try { System.IO.File.SetCreationTimeUtc(dstPath, srcFi.CreationTimeUtc); } catch { /* не критично */ }
+                    System.IO.File.SetLastWriteTimeUtc(dstPath, srcMeta.LastWriteUtc);
+                    try
+                    {
+                        // CreationTime не кэшировали: читаем только при реальной копии.
+                        System.IO.File.SetCreationTimeUtc(dstPath, new FileInfo(srcPath).CreationTimeUtc);
+                    }
+                    catch { /* не критично */ }
                     copied++;
-                    bytesCopied += srcFi.Length;
+                    bytesCopied += srcMeta.Size;
                     targetIndex[rel] = srcKey; // копия теперь идентична источнику
                 }
 
-                progress?.Report(new SyncProgress(i + 1, sourceFiles.Count,
-                    bytesCopied, totalBytes, srcPath, SyncPhase.Copying));
+                // Троттлинг прогресса: не чаще 1 раза в 100 мс, либо при изменении
+                // процента завершения хотя бы на 1% (что наступит раньше).
+                int currentPercent = totalBytes > 0
+                    ? (int)(bytesCopied * 100L / totalBytes)
+                    : (i == sourceFiles.Count - 1 ? 100 : 0);
+
+                if (progress is not null)
+                {
+                    bool shouldReport = currentPercent != lastReportedPercent ||
+                                       progressStopwatch.ElapsedMilliseconds >= 100;
+                    if (shouldReport)
+                    {
+                        progress.Report(new SyncProgress('\0', i + 1, sourceFiles.Count,
+                            copied, skipped, bytesCopied, totalBytes, srcPath, SyncPhase.Copying));
+                        lastReportedPercent = currentPercent;
+                        progressStopwatch.Restart();
+                    }
+                }
 
             }
             catch (OperationCanceledException) { throw; }
@@ -173,9 +224,6 @@ public sealed class FileSyncService
         if (_mirror)
         {
             // SEC: B-04 — удалять только внутри targetDir, без reparse points.
-            progress?.Report(new SyncProgress(sourceFiles.Count, sourceFiles.Count,
-                bytesCopied, totalBytes, "", SyncPhase.Pruning));
-
             var fullTargetDir = Path.GetFullPath(targetDir);
             // Защита от удаления корня диска/системной папки.
             var root = Path.GetPathRoot(fullTargetDir);
@@ -190,16 +238,16 @@ public sealed class FileSyncService
             {
                 // Множество файлов, присутствующих на флешке (по относительному пути).
                 var expectedOnSource = new HashSet<string>(
-                    sourceFiles.Select(s => Path.GetRelativePath(sourceDir, s)),
+                    sourceFiles.Select(s => Path.GetRelativePath(sourceDir, s.Path)),
                     StringComparer.OrdinalIgnoreCase);
 
                 var sep = Path.DirectorySeparatorChar;
                 var prefix = fullTargetDir.TrimEnd(sep) + sep;
 
-                foreach (var rel in targetIndex.Keys.ToList())
+                var toDelete = new List<string>();
+                foreach (var rel in targetIndex.Keys)
                 {
                     if (expectedOnSource.Contains(rel)) continue;
-                    ct.ThrowIfCancellationRequested();
 
                     string dst;
                     try { dst = Path.GetFullPath(Path.Combine(fullTargetDir, rel)); }
@@ -216,11 +264,25 @@ public sealed class FileSyncService
                         continue;
                     }
 
+                    toDelete.Add(rel);
+                }
+
+                int totalToPrune = toDelete.Count;
+                progress?.Report(new SyncProgress('\0', 0, totalToPrune, copied, skipped, 0, totalToPrune, "", SyncPhase.Pruning));
+
+                int pruned = 0;
+                foreach (var rel in toDelete)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    string dst = Path.GetFullPath(Path.Combine(fullTargetDir, rel));
+
                     try
                     {
                         System.IO.File.Delete(dst);
                         deleted++;
+                        pruned++;
                         AppLog.Info($"[MIRROR] Удалён из бэкапа: {dst}");
+                        progress?.Report(new SyncProgress('\0', pruned, totalToPrune, copied, skipped, pruned, totalToPrune, dst, SyncPhase.Pruning));
                     }
                     catch (Exception ex) { AppLog.Error(ex, $"Не удалось удалить {dst}"); }
                 }
@@ -228,8 +290,8 @@ public sealed class FileSyncService
             }
         }
 
-        progress?.Report(new SyncProgress(sourceFiles.Count, sourceFiles.Count,
-            bytesCopied, totalBytes, "", SyncPhase.Done));
+        progress?.Report(new SyncProgress('\0', sourceFiles.Count, sourceFiles.Count,
+            copied, skipped, bytesCopied, totalBytes, "", SyncPhase.Completed));
 
         AppLog.Info(
             $"SyncAll {sourceDir} → {targetDir}: копий {copied}, пропущено {skipped}, " +
@@ -288,7 +350,7 @@ public sealed class FileSyncService
     // =====================================================================
 
     /// <summary>Метаданные всех файлов (рекурсивно). Не открывает содержимое файлов.</summary>
-    private List<string> SnapshotFiles(string root)
+    private List<FileMeta> SnapshotFiles(string root)
     {
         var opts = new EnumerationOptions
         {
@@ -298,7 +360,23 @@ public sealed class FileSyncService
                 ? FileAttributes.Hidden | FileAttributes.System | FileAttributes.ReparsePoint
                 : FileAttributes.ReparsePoint,
         };
-        return Directory.EnumerateFiles(root, "*", opts).ToList();
+
+        var result = new List<FileMeta>();
+        foreach (var path in Directory.EnumerateFiles(root, "*", opts))
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                result.Add(new FileMeta(path, fi.Length, fi.LastWriteTimeUtc));
+            }
+            catch
+            {
+                // Файл мог исчезнуть/быть недоступен во время обхода — сохраняем путь,
+                // размер впоследствии будет вычислен при попытке копирования.
+                result.Add(new FileMeta(path, 0, DateTime.MinValue));
+            }
+        }
+        return result;
     }
 
     /// <summary>Индекс приёмной папки: относительный путь → (размер, дата UTC).</summary>
@@ -332,29 +410,35 @@ public sealed class FileSyncService
     ///   • запись во временный .tmp + атомарный Move = бэкап всегда согласован.
     /// Reserved temp-файлы «недокопированного» вида невозможны.
     /// </summary>
-    private static async Task CopyChunkedAsync(string src, string dst, CancellationToken ct)
+    private async Task CopyChunkedAsync(string src, string dst, CancellationToken ct)
     {
         var tmp = dst + ".tmp";
+        var chunk = _bufferSize;
 
         try
         {
             await using (var srcStream = new FileStream(
                 src, FileMode.Open, FileAccess.Read,
                 FileShare.Read | FileShare.Write | FileShare.Delete, // не блокируем открытие пользователем
-                CHUNK, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                chunk, FileOptions.Asynchronous | FileOptions.SequentialScan))
             await using (var dstStream = new FileStream(
                 tmp, FileMode.Create, FileAccess.Write, FileShare.None,
-                CHUNK, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                chunk, FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
-                var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(CHUNK);
+                var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(chunk);
                 try
                 {
                     int read;
-                    while ((read = await srcStream.ReadAsync(buffer.AsMemory(0, CHUNK), ct)) > 0)
+                    while ((read = await srcStream.ReadAsync(buffer.AsMemory(0, chunk), ct)) > 0)
                     {
                         await dstStream.WriteAsync(buffer.AsMemory(0, read), ct);
                     }
                     await dstStream.FlushAsync(ct);
+                    if (_flushAfterFile)
+                    {
+                        // Физический сброс буфера ОС на накопитель (надёжнее при выдёргивании).
+                        dstStream.Flush(true);
+                    }
                 }
                 finally { System.Buffers.ArrayPool<byte>.Shared.Return(buffer); }
             }

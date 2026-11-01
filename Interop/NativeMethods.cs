@@ -103,6 +103,10 @@ internal static class NativeMethods
     public static extern IntPtr DefSubclassProc(
         IntPtr hWnd, uint uMsg, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr DefWindowProc(
+        IntPtr hWnd, uint uMsg, IntPtr wParam, IntPtr lParam);
+
     // ---------- Метрики (Task Manager: «меньше памяти в простое») ----------
 
     /// <summary>

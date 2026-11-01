@@ -51,6 +51,12 @@ internal static class WindowMinSize
 
     private static IntPtr OnSubclass(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, uint id, IntPtr refData)
     {
+        if (msg == 0x020A || msg == 0x020E) // WM_MOUSEWHEEL / WM_MOUSEHWHEEL
+        {
+            AppLog.Info($"Wheel received by WindowMinSize subclass: delta={(short)(wParam.ToInt64() >> 16)}");
+            return DefSubclassProc(hWnd, msg, wParam, lParam);
+        }
+
         if (msg == WM_GETMINMAXINFO && lParam != IntPtr.Zero)
         {
             var info = Marshal.PtrToStructure<MINMAXINFO>(lParam);
