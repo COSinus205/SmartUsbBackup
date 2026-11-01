@@ -78,17 +78,21 @@ public sealed class FileSyncService
     private readonly bool _skipHiddenSystem;
     private readonly int _bufferSize;
     private readonly bool _flushAfterFile;
+    private readonly bool _fastSmallFileCopy;
+    private readonly bool _useTargetIndexCache;
 
     /// <summary>Кэш метаданных файла (избегаем повторного FileInfo в цикле копирования).</summary>
-    private readonly record struct FileMeta(string Path, long Size, DateTime LastWriteUtc);
+    private readonly record struct FileMeta(string Path, long Size, DateTime LastWriteUtc, DateTime CreationUtc);
 
-    public FileSyncService(bool mirror, bool verifyByCrc, bool skipHiddenSystem, int bufferSizeKb = 4096, bool flushAfterFile = true)
+    public FileSyncService(bool mirror, bool verifyByCrc, bool skipHiddenSystem, int bufferSizeKb = 4096, bool flushAfterFile = true, bool fastSmallFileCopy = false, bool useTargetIndexCache = true)
     {
         _mirror = mirror;
         _verifyByCrc = verifyByCrc;
         _skipHiddenSystem = skipHiddenSystem;
-        _bufferSize = Math.Clamp(bufferSizeKb * 1024, 64 * 1024, 8 * 1024 * 1024);
+        _bufferSize = Math.Clamp(bufferSizeKb * 1024, 64 * 1024, 16 * 1024 * 1024);
         _flushAfterFile = flushAfterFile;
+        _fastSmallFileCopy = fastSmallFileCopy;
+        _useTargetIndexCache = useTargetIndexCache;
     }
 
     // =====================================================================
@@ -110,7 +114,7 @@ public sealed class FileSyncService
         long totalBytes;
         try
         {
-            sourceFiles = SnapshotFiles(sourceDir);
+            sourceFiles = SnapshotFiles(sourceDir, progress);
             totalBytes = 0;
             foreach (var f in sourceFiles)
             {
@@ -129,8 +133,22 @@ public sealed class FileSyncService
 
         // Индекс приёмной стороны для O(1)-сравнения по относительному пути.
         var targetIndex = BuildTargetIndex(targetDir);
+        if (_useTargetIndexCache) SaveTargetIndexCache(targetDir, targetIndex);
 
         progress?.Report(new SyncProgress('\0', 0, sourceFiles.Count, 0, 0, 0, totalBytes, "", SyncPhase.Scanning));
+
+        // Предварительное создание всех целевых каталогов: меньше повторных CreateDirectory
+        // на один и тот же путь для файлов из одной папки.
+        var targetDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var fm in sourceFiles)
+        {
+            targetDirs.Add(Path.GetDirectoryName(Path.Combine(targetDir, Path.GetRelativePath(sourceDir, fm.Path)))!);
+        }
+        foreach (var d in targetDirs)
+        {
+            try { Directory.CreateDirectory(d); }
+            catch { /* будет повторная попытка перед конкретным файлом */ }
+        }
 
         // Троттлинг UI-прогресса: лимит 1 отчёт на 100 мс или при сдвиге на 1%.
         var progressStopwatch = Stopwatch.StartNew();
@@ -171,14 +189,25 @@ public sealed class FileSyncService
                 else
                 {
                     Directory.CreateDirectory(Path.GetDirectoryName(dstPath)!);
-                    await CopyChunkedAsync(srcPath, dstPath, ct);
+
+                    // Мелкие файлы выгоднее копировать через Win32/OS CopyFile (быстрее
+                    // за счёт ядра ОС и меньших managed I/O-накладных расходов).
+                    if (_fastSmallFileCopy && srcMeta.Size > 0 && srcMeta.Size <= 4 * 1024 * 1024)
+                    {
+                        System.IO.File.Copy(srcPath, dstPath, overwrite: true);
+                    }
+                    else
+                    {
+                        await CopyChunkedAsync(srcPath, dstPath, ct);
+                    }
+
                     // Сохраняем метаданные: иначе на следующем запуске mtime целевого файла
                     // будет «сейчас» и инкрементальное сравнение всегда будет считать файл новым.
                     System.IO.File.SetLastWriteTimeUtc(dstPath, srcMeta.LastWriteUtc);
                     try
                     {
-                        // CreationTime не кэшировали: читаем только при реальной копии.
-                        System.IO.File.SetCreationTimeUtc(dstPath, new FileInfo(srcPath).CreationTimeUtc);
+                        if (srcMeta.CreationUtc != DateTime.MinValue)
+                            System.IO.File.SetCreationTimeUtc(dstPath, srcMeta.CreationUtc);
                     }
                     catch { /* не критично */ }
                     copied++;
@@ -281,6 +310,7 @@ public sealed class FileSyncService
                         System.IO.File.Delete(dst);
                         deleted++;
                         pruned++;
+                        if (_useTargetIndexCache) targetIndex.Remove(rel);
                         AppLog.Info($"[MIRROR] Удалён из бэкапа: {dst}");
                         progress?.Report(new SyncProgress('\0', pruned, totalToPrune, copied, skipped, pruned, totalToPrune, dst, SyncPhase.Pruning));
                     }
@@ -289,6 +319,8 @@ public sealed class FileSyncService
                 CleanupEmptyDirs(fullTargetDir);
             }
         }
+
+        if (_useTargetIndexCache) SaveTargetIndexCache(targetDir, targetIndex);
 
         progress?.Report(new SyncProgress('\0', sourceFiles.Count, sourceFiles.Count,
             copied, skipped, bytesCopied, totalBytes, "", SyncPhase.Completed));
@@ -350,7 +382,7 @@ public sealed class FileSyncService
     // =====================================================================
 
     /// <summary>Метаданные всех файлов (рекурсивно). Не открывает содержимое файлов.</summary>
-    private List<FileMeta> SnapshotFiles(string root)
+    private List<FileMeta> SnapshotFiles(string root, IProgress<SyncProgress>? progress = null)
     {
         var opts = new EnumerationOptions
         {
@@ -362,28 +394,57 @@ public sealed class FileSyncService
         };
 
         var result = new List<FileMeta>();
-        foreach (var path in Directory.EnumerateFiles(root, "*", opts))
+        int count = 0;
+        var sw = Stopwatch.StartNew();
+        var rootDir = new DirectoryInfo(root);
+        foreach (var fi in rootDir.EnumerateFiles("*", opts))
         {
+            var path = fi.FullName;
             try
             {
-                var fi = new FileInfo(path);
-                result.Add(new FileMeta(path, fi.Length, fi.LastWriteTimeUtc));
+                result.Add(new FileMeta(path, fi.Length, fi.LastWriteTimeUtc, fi.CreationTimeUtc));
             }
             catch
             {
                 // Файл мог исчезнуть/быть недоступен во время обхода — сохраняем путь,
                 // размер впоследствии будет вычислен при попытке копирования.
-                result.Add(new FileMeta(path, 0, DateTime.MinValue));
+                result.Add(new FileMeta(path, 0, DateTime.MinValue, DateTime.MinValue));
             }
+
+            count++;
+            if (progress is not null && (count % 1024 == 0 || sw.ElapsedMilliseconds >= 250))
+            {
+                progress.Report(new SyncProgress('\0', count, 0, 0, 0, 0, 0, path, SyncPhase.Scanning));
+                sw.Restart();
+            }
+        }
+
+        if (progress is not null && count > 0)
+        {
+            progress.Report(new SyncProgress('\0', count, count, 0, 0, 0, 0, root, SyncPhase.Scanning));
         }
         return result;
     }
 
     /// <summary>Индекс приёмной папки: относительный путь → (размер, дата UTC).</summary>
-    private static Dictionary<string, FileKey> BuildTargetIndex(string targetDir)
+    private Dictionary<string, FileKey> BuildTargetIndex(string targetDir)
     {
         var idx = new Dictionary<string, FileKey>(StringComparer.OrdinalIgnoreCase);
         if (!Directory.Exists(targetDir)) return idx;
+
+        if (_useTargetIndexCache)
+        {
+            var cached = TryReadTargetIndexCache(targetDir);
+            if (cached is not null)
+            {
+                foreach (var e in cached.Entries)
+                {
+                    if (string.IsNullOrWhiteSpace(e.Path)) continue;
+                    idx[e.Path] = new FileKey(e.Size, new DateTime(e.LastWriteUtcTicks, DateTimeKind.Utc));
+                }
+                return idx;
+            }
+        }
 
         var opts = new EnumerationOptions
         {
@@ -391,12 +452,11 @@ public sealed class FileSyncService
             IgnoreInaccessible = true,
             AttributesToSkip = FileAttributes.ReparsePoint,
         };
-        foreach (var f in Directory.EnumerateFiles(targetDir, "*", opts))
+        foreach (var fi in new DirectoryInfo(targetDir).EnumerateFiles("*", opts))
         {
             try
             {
-                var fi = new FileInfo(f);
-                idx[Path.GetRelativePath(targetDir, f)] = new FileKey(fi.Length, fi.LastWriteTimeUtc);
+                idx[Path.GetRelativePath(targetDir, fi.FullName)] = new FileKey(fi.Length, fi.LastWriteTimeUtc);
             }
             catch { /* файл мог исчезнуть во время обхода */ }
         }
@@ -410,6 +470,77 @@ public sealed class FileSyncService
     ///   • запись во временный .tmp + атомарный Move = бэкап всегда согласован.
     /// Reserved temp-файлы «недокопированного» вида невозможны.
     /// </summary>
+    private sealed class TargetIndexCache
+    {
+        public int Version { get; set; } = 1;
+        public long RootLastWriteUtcTicks { get; set; }
+        public List<TargetIndexEntry> Entries { get; set; } = new();
+    }
+
+    private sealed class TargetIndexEntry
+    {
+        public string Path { get; set; } = string.Empty;
+        public long Size { get; set; }
+        public long LastWriteUtcTicks { get; set; }
+    }
+
+    private static string GetTargetIndexCachePath(string targetDir)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var hash = Convert.ToHexString(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(targetDir)));
+        return Path.Combine(SettingsStore.Dir, "target-index", hash.Substring(0, 24) + ".json");
+    }
+
+    private static TargetIndexCache? TryReadTargetIndexCache(string targetDir)
+    {
+        var path = GetTargetIndexCachePath(targetDir);
+        if (!File.Exists(path) || !Directory.Exists(targetDir)) return null;
+        try
+        {
+            var json = File.ReadAllText(path);
+            var cache = System.Text.Json.JsonSerializer.Deserialize<TargetIndexCache>(
+                json, new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            if (cache is null || cache.Version != 1) return null;
+            var currentRoot = Directory.GetLastWriteTimeUtc(targetDir).Ticks;
+            if (cache.RootLastWriteUtcTicks != currentRoot) return null;
+            return cache;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void SaveTargetIndexCache(string targetDir, Dictionary<string, FileKey> index)
+    {
+        if (!Directory.Exists(targetDir)) return;
+        try
+        {
+            var cache = new TargetIndexCache
+            {
+                RootLastWriteUtcTicks = Directory.GetLastWriteTimeUtc(targetDir).Ticks,
+                Entries = index.Select(kv => new TargetIndexEntry
+                {
+                    Path = kv.Key,
+                    Size = kv.Value.Size,
+                    LastWriteUtcTicks = kv.Value.LastWriteUtc.Ticks,
+                }).ToList(),
+            };
+
+            var dir = Path.GetDirectoryName(GetTargetIndexCachePath(targetDir))!;
+            Directory.CreateDirectory(dir);
+            var final = GetTargetIndexCachePath(targetDir);
+            var tmp = final + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            File.WriteAllText(tmp, System.Text.Json.JsonSerializer.Serialize(cache, new System.Text.Json.JsonSerializerOptions { WriteIndented = false }));
+            if (File.Exists(final)) File.Delete(final);
+            File.Move(tmp, final);
+        }
+        catch
+        {
+            // Кэш не критичен: при неудаче просто будет полное сканирование.
+        }
+    }
+
     private async Task CopyChunkedAsync(string src, string dst, CancellationToken ct)
     {
         var tmp = dst + ".tmp";

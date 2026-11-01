@@ -120,11 +120,16 @@ public sealed partial class MainWindow : Window
         ChkDefaultEnabled.IsChecked = SettingsStore.Current.DefaultEnabled;
 
         ChkDefaultFlush.IsChecked = SettingsStore.Current.DefaultFlushAfterFile;
+        ChkDefaultFastCopy.IsChecked = SettingsStore.Current.DefaultFastCopy;
         CmbDefaultBuffer.SelectedIndex = SettingsStore.Current.DefaultBufferSizeKb switch
         {
-            1024 => 0,
-            8192 => 2,
-            _ => 1,
+            512 => 0,
+            1024 => 1,
+            2048 => 2,
+            4096 => 3,
+            8192 => 4,
+            16384 => 5,
+            _ => 3,
         };
         TxtSettingsBackupPath.Text = SettingsStore.Current.BaseBackupPath;
     RefreshStartupCheckboxFromRegistry();
@@ -563,12 +568,24 @@ public sealed partial class MainWindow : Window
     private void OnDefaultBufferChanged(object? sender, SelectionChangedEventArgs e)
     {
         if (CmbDefaultBuffer.SelectedIndex < 0) return;
-        int kb = CmbDefaultBuffer.SelectedIndex switch { 0 => 1024, 2 => 8192, _ => 4096 };
+        int kb = CmbDefaultBuffer.SelectedIndex switch
+        {
+            0 => 512,
+            1 => 1024,
+            2 => 2048,
+            3 => 4096,
+            4 => 8192,
+            5 => 16384,
+            _ => 4096,
+        };
         SaveSetting(s => s.DefaultBufferSizeKb = kb);
     }
 
     private void OnDefaultFlushChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultFlushAfterFile = true);
     private void OnDefaultFlushUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultFlushAfterFile = false);
+
+    private void OnDefaultFastCopyChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultFastCopy = true);
+    private void OnDefaultFastCopyUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultFastCopy = false);
 
     private void OnDefaultEnabledChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultEnabled = true);
     private void OnDefaultEnabledUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultEnabled = false);
@@ -732,24 +749,37 @@ public sealed partial class MainWindow : Window
         var bufferLabel = new TextBlock { Text = "Размер буфера, КБ:" };
         var cmbBuffer = new ComboBox { Width = 120 };
         cmbBuffer.Items.Add(new ComboBoxItem { Content = "по стандарту" });
+        cmbBuffer.Items.Add(new ComboBoxItem { Content = "512" });
         cmbBuffer.Items.Add(new ComboBoxItem { Content = "1024" });
+        cmbBuffer.Items.Add(new ComboBoxItem { Content = "2048" });
         cmbBuffer.Items.Add(new ComboBoxItem { Content = "4096" });
         cmbBuffer.Items.Add(new ComboBoxItem { Content = "8192" });
+        cmbBuffer.Items.Add(new ComboBoxItem { Content = "16384" });
         cmbBuffer.SelectedIndex = profile.BufferSizeKbOverride switch
         {
             null => 0,
-            1024 => 1,
-            4096 => 2,
-            8192 => 3,
-            _ => (profile.BufferSizeKbOverride < 2048 ? 1 : (profile.BufferSizeKbOverride < 6144 ? 2 : 3)),
+            512 => 1,
+            1024 => 2,
+            2048 => 3,
+            4096 => 4,
+            8192 => 5,
+            16384 => 6,
+            _ => profile.BufferSizeKbOverride < 768 ? 1 :
+                (profile.BufferSizeKbOverride < 1536 ? 2 :
+                (profile.BufferSizeKbOverride < 3072 ? 3 :
+                (profile.BufferSizeKbOverride < 6144 ? 4 :
+                (profile.BufferSizeKbOverride < 12288 ? 5 : 6)))),
         };
         cmbBuffer.SelectionChanged += (_, _) =>
         {
             profile.BufferSizeKbOverride = cmbBuffer.SelectedIndex switch
             {
-                1 => 1024,
-                2 => 4096,
-                3 => 8192,
+                1 => 512,
+                2 => 1024,
+                3 => 2048,
+                4 => 4096,
+                5 => 8192,
+                6 => 16384,
                 _ => null,
             };
             SettingsStore.Save();
@@ -758,6 +788,10 @@ public sealed partial class MainWindow : Window
         var chkFlush = CreateLabeledCheckBox("Flush после файла (надёжно)", profile.FlushAfterFileOverride ?? SettingsStore.Current.DefaultFlushAfterFile);
         chkFlush.Checked += (_, _) => { profile.FlushAfterFileOverride = true; SettingsStore.Save(); };
         chkFlush.Unchecked += (_, _) => { profile.FlushAfterFileOverride = false; SettingsStore.Save(); };
+
+        var chkFastCopy = CreateLabeledCheckBox("Быстрое копирование мелких файлов", profile.FastSmallFileCopyOverride ?? SettingsStore.Current.DefaultFastCopy);
+        chkFastCopy.Checked += (_, _) => { profile.FastSmallFileCopyOverride = true; SettingsStore.Save(); };
+        chkFastCopy.Unchecked += (_, _) => { profile.FastSmallFileCopyOverride = false; SettingsStore.Save(); };
 
         var testedText = new TextBlock
         {
@@ -787,6 +821,8 @@ public sealed partial class MainWindow : Window
                 profile.VerifyByCrcOverride = null;
                 profile.SkipHiddenSystemOverride = null;
                 profile.LiveWatchOverride = null;
+                profile.FastSmallFileCopyOverride = null;
+                profile.BufferSizeKbOverride = null;
                 profile.SettingsTested = false;
 
                 var progress = new Progress<SyncProgress>(p => OnProgress(p));
@@ -799,12 +835,21 @@ public sealed partial class MainWindow : Window
                 cmbBuffer.SelectedIndex = profile.BufferSizeKbOverride switch
                 {
                     null => 0,
-                    1024 => 1,
-                    4096 => 2,
-                    8192 => 3,
-                    _ => (profile.BufferSizeKbOverride < 2048 ? 1 : (profile.BufferSizeKbOverride < 6144 ? 2 : 3)),
+                    512 => 1,
+                    1024 => 2,
+                    2048 => 3,
+                    4096 => 4,
+                    8192 => 5,
+                    16384 => 6,
+                    _ => profile.BufferSizeKbOverride < 768 ? 1 :
+                        (profile.BufferSizeKbOverride < 1536 ? 2 :
+                        (profile.BufferSizeKbOverride < 3072 ? 3 :
+                        (profile.BufferSizeKbOverride < 6144 ? 4 :
+                        (profile.BufferSizeKbOverride < 12288 ? 5 : 6)))),
                 };
                 chkFlush.IsChecked = profile.FlushAfterFileOverride ?? SettingsStore.Current.DefaultFlushAfterFile;
+                chkFastCopy.IsChecked = profile.FastSmallFileCopyOverride ?? SettingsStore.Current.DefaultFastCopy;
+                chkFastCopy.IsChecked = profile.FastSmallFileCopyOverride ?? SettingsStore.Current.DefaultFastCopy;
 
                 testedText.Text = $"Настройки протестированы: {(profile.SettingsTested ? "да" : "нет")}";
                 statusText.Text = BuildDriveStatusText(profile);
@@ -881,6 +926,7 @@ public sealed partial class MainWindow : Window
             profile.LiveWatchOverride = null;
             profile.BufferSizeKbOverride = null;
             profile.FlushAfterFileOverride = null;
+            profile.FastSmallFileCopyOverride = null;
             profile.SettingsTested = false;
             SettingsStore.Save();
 
@@ -895,6 +941,7 @@ public sealed partial class MainWindow : Window
                 _ => 1,
             };
             chkFlush.IsChecked = SettingsStore.Current.DefaultFlushAfterFile;
+            chkFastCopy.IsChecked = SettingsStore.Current.DefaultFastCopy;
             testedText.Text = "Настройки протестированы: нет";
             statusText.Text = BuildDriveStatusText(profile);
             TxtGlobalStatus.Text = $"Настройки «{profile.Label}» сброшены к стандартным.";
@@ -915,18 +962,22 @@ public sealed partial class MainWindow : Window
             Spacing = 8,
             Children = { btnRelocateBackup, btnResetBackupPath },
         });
+        stack.Children.Add(new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            Children = { btnTest, btnResetSettings },
+        });
         stack.Children.Add(statusText);
-        stack.Children.Add(chkEnabled);
         stack.Children.Add(chkMirror);
-        stack.Children.Add(chkCrc);
         stack.Children.Add(chkHidden);
+        stack.Children.Add(chkFastCopy);
+        stack.Children.Add(chkEnabled);
         stack.Children.Add(chkLive);
+        stack.Children.Add(chkCrc);
+        stack.Children.Add(chkFlush);
         stack.Children.Add(bufferLabel);
         stack.Children.Add(cmbBuffer);
-        stack.Children.Add(chkFlush);
-        stack.Children.Add(testedText);
-        stack.Children.Add(btnTest);
-        stack.Children.Add(btnResetSettings);
 
         var rootGrid = new Grid { Padding = new Thickness(16) };
         rootGrid.Children.Add(new ScrollViewer { Content = stack });
@@ -1479,10 +1530,15 @@ public sealed partial class MainWindow : Window
 
             case SyncPhase.Scanning:
                 GlobalProgressBar.Visibility = Visibility.Visible;
+                // Обход дерева может идти долго: показываем прогресс как пульсацию,
+                // а имя флешки + число уже увиденных файлов — в строке статуса.
                 GlobalProgressBar.IsIndeterminate = true;
                 GlobalProgressBar.Maximum = 100;
                 GlobalProgressBar.Value = 0;
-                TxtGlobalStatus.Text = $"Сканирование {drive}";
+                if (p.ProcessedCount > 0)
+                    TxtGlobalStatus.Text = $"Сканирование {drive}: {p.ProcessedCount} файлов";
+                else
+                    TxtGlobalStatus.Text = $"Сканирование {drive}";
                 break;
 
             case SyncPhase.Copying:

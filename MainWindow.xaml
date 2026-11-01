@@ -251,26 +251,34 @@
         <StackPanel Padding="24,20,24,24" Spacing="12">
           <TextBlock Text="Глобальные настройки" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,8" />
 
-          <CheckBox x:Name="ChkMirror"   Content="Зеркало"             Checked="OnMirrorChecked"   Unchecked="OnMirrorUnchecked" />
-          <CheckBox x:Name="ChkCrc"      Content="Проверять CRC32"     Checked="OnCrcChecked"      Unchecked="OnCrcUnchecked" />
-          <CheckBox x:Name="ChkSkipHidden" Content="Пропускать скрытые/системные" Checked="OnSkipHiddenChecked" Unchecked="OnSkipHiddenUnchecked" ToolTipService.ToolTip="Влияет на то, какие файлы флешки включаются в синхронизацию." />
-          <CheckBox x:Name="ChkStartup"  Content="Запускать с Windows" Checked="OnStartupChecked"  Unchecked="OnStartupUnchecked" />
-          <CheckBox x:Name="ChkLiveWatch" Content="Обновлять сразу (watch)" Checked="OnLiveChecked" Unchecked="OnLiveUnchecked" ToolTipService.ToolTip="Если включено — изменения на флешке сразу копируются." />
-          <CheckBox x:Name="ChkAutoUpdate" Content="Автообновление приложения" Checked="OnAutoUpdateChecked" Unchecked="OnAutoUpdateUnchecked" />
-          <CheckBox x:Name="ChkAutoTestNewDrives" Content="Тестировать новую флешку при первом подключении" Checked="OnAutoTestChecked" Unchecked="OnAutoTestUnchecked" ToolTipService.ToolTip="Запускает безопасный тест чтения перед синхронизацией и подбирает настройки для этой флешки." />
-          <CheckBox x:Name="ChkDefaultEnabled" Content="Активировать новые флешки автоматически" Checked="OnDefaultEnabledChecked" Unchecked="OnDefaultEnabledUnchecked" ToolTipService.ToolTip="Если включено — при первом подключении флешка сразу начинает резервироваться." />
-
           <TextBlock Text="Папка хранения бэкапов (глобальная):" Margin="0,8,0,0" />
           <TextBox x:Name="TxtSettingsBackupPath" IsReadOnly="True" Text="" />
           <Button Content="Выбрать папку хранения..." Click="OnSettingsBrowseClicked" />
 
+          <CheckBox x:Name="ChkStartup"  Content="Запускать с Windows" Checked="OnStartupChecked"  Unchecked="OnStartupUnchecked" />
+          <CheckBox x:Name="ChkAutoUpdate" Content="Автообновление приложения" Checked="OnAutoUpdateChecked" Unchecked="OnAutoUpdateUnchecked" />
+
+          <CheckBox x:Name="ChkMirror"   Content="Зеркало"             Checked="OnMirrorChecked"   Unchecked="OnMirrorUnchecked" />
+          <CheckBox x:Name="ChkSkipHidden" Content="Пропускать скрытые/системные" Checked="OnSkipHiddenChecked" Unchecked="OnSkipHiddenUnchecked" ToolTipService.ToolTip="Влияет на то, какие файлы флешки включаются в синхронизацию." />
+
+          <CheckBox x:Name="ChkAutoTestNewDrives" Content="Тестировать новую флешку при первом подключении" Checked="OnAutoTestChecked" Unchecked="OnAutoTestUnchecked" ToolTipService.ToolTip="Запускает безопасный тест чтения перед синхронизацией и подбирает настройки для этой флешки." />
+          <CheckBox x:Name="ChkDefaultFastCopy" Content="Быстрое копирование мелких файлов (менее надёжно)" Checked="OnDefaultFastCopyChecked" Unchecked="OnDefaultFastCopyUnchecked" ToolTipService.ToolTip="Если включено — мелкие файлы копируются прямо в целевой файл (быстрее, но возможен частичный файл при резком извлечении флешки). Если выключено — используется атомарный путь .tmp → Move." />
+          <CheckBox x:Name="ChkDefaultEnabled" Content="Активировать новые флешки автоматически" Checked="OnDefaultEnabledChecked" Unchecked="OnDefaultEnabledUnchecked" ToolTipService.ToolTip="Если включено — при первом подключении флешка сразу начинает резервироваться." />
+          <CheckBox x:Name="ChkLiveWatch" Content="Обновлять сразу (watch)" Checked="OnLiveChecked" Unchecked="OnLiveUnchecked" ToolTipService.ToolTip="Если включено — изменения на флешке сразу копируются." />
+
+          <CheckBox x:Name="ChkCrc"      Content="Проверять CRC32"     Checked="OnCrcChecked"      Unchecked="OnCrcUnchecked" />
+
+          <CheckBox x:Name="ChkDefaultFlush" Content="Flush после файла (надёжно)" Checked="OnDefaultFlushChecked" Unchecked="OnDefaultFlushUnchecked" ToolTipService.ToolTip="Принудительно сбрасывать записанные данные на флешку после каждого файла." />
+
           <TextBlock Text="Размер буфера по умолчанию, КБ:" Margin="0,8,0,0" />
           <ComboBox x:Name="CmbDefaultBuffer" Width="120" SelectionChanged="OnDefaultBufferChanged">
+            <ComboBoxItem Content="512" />
             <ComboBoxItem Content="1024" />
+            <ComboBoxItem Content="2048" />
             <ComboBoxItem Content="4096" />
             <ComboBoxItem Content="8192" />
+            <ComboBoxItem Content="16384" />
           </ComboBox>
-          <CheckBox x:Name="ChkDefaultFlush" Content="Flush после файла (надёжно)" Checked="OnDefaultFlushChecked" Unchecked="OnDefaultFlushUnchecked" ToolTipService.ToolTip="Принудительно сбрасывать записанные данные на флешку после каждого файла." />
 
           <TextBlock Text="Стандарты для новых флешек: флешка при первом подключении получает указанные выше настройки; затем они могут быть уточнены тестом и сохранены индивидуально." TextWrapping="Wrap" Opacity="0.8" Margin="0,8,0,0" />
         </StackPanel>

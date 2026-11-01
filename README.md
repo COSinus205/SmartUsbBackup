@@ -3,13 +3,13 @@
 Современное приложение для зеркального резервного копирования USB-флешек с нулевой нагрузкой на процессор в режиме ожидания.
 
 <div align="center">
-  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.1.0">
-    <img src="https://img.shields.io/badge/Download%20installer-4.1.0-blue?style=for-the-badge" alt="Download Smart USB Backup 4.1.0 installer">
+  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.2.0">
+    <img src="https://img.shields.io/badge/Download%20installer-4.2.0-blue?style=for-the-badge" alt="Download Smart USB Backup 4.2.0 installer">
   </a>
   </a>
 </div>
 
-> Latest installer: [SmartUsbBackup-Setup-4.1.0.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.0.1)
+> Latest installer: [SmartUsbBackup-Setup-4.2.0.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.2.0)
 
 ## Основные возможности
 
@@ -44,7 +44,7 @@ dotnet build -c Release
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\SmartUsbBackup.iss
 ```
 
-Результат: `installer/dist/SmartUsbBackup-Setup-4.1.0.exe`.
+Результат: `installer/dist/SmartUsbBackup-Setup-4.2.0.exe`.
 
 Установка per-user, без прав администратора. При удалении предлагается выбрать, какие копии флешек удалить.
 
@@ -72,7 +72,7 @@ dotnet build -c Release
 | `Interop/NativeMethods.cs` | Win32-interop/helper'ы (ShowWindow, SetForegroundWindow и др.). |
 | `Interop/WindowMinSize.cs` | Минимальный размер окна через `WM_GETMINMAXINFO`. |
 | `installer/SmartUsbBackup.iss` | Скрипт Inno Setup (per-user install, деинсталляция, Pascal Script). |
-| `installer/dist/SmartUsbBackup-Setup-4.1.0.exe` | Собранный установщик (релиз). |
+| `installer/dist/SmartUsbBackup-Setup-4.2.0.exe` | Собранный установщик (релиз). |
 
 ## CI / Сборка
 

@@ -68,6 +68,9 @@ public sealed class DriveProfile
     [JsonPropertyName("flushAfterFileOverride")]
     public bool? FlushAfterFileOverride { get; set; }
 
+    [JsonPropertyName("fastSmallFileCopyOverride")]
+    public bool? FastSmallFileCopyOverride { get; set; }
+
     [JsonPropertyName("baseBackupPathOverride")]
     public string? BaseBackupPathOverride { get; set; }
 
@@ -110,6 +113,14 @@ public sealed class AppSettings
 
     [JsonPropertyName("defaultFlushAfterFile")]
     public bool DefaultFlushAfterFile { get; set; } = true;
+
+    /// <summary>
+    /// Если включено — мелкие файлы копируются прямо в целевой файл (быстрее,
+    /// но менее безопасно при резком извлечении флешки). Если выключено —
+    /// всегда используется атомарный путь .tmp → Move.
+    /// </summary>
+    [JsonPropertyName("defaultFastCopy")]
+    public bool DefaultFastCopy { get; set; } = false;
 
     [JsonPropertyName("skipHiddenSystem")]
     public bool SkipHiddenSystem { get; set; } = true;

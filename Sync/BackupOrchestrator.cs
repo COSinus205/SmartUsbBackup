@@ -91,7 +91,8 @@ public sealed class BackupOrchestrator : IDisposable
             profile.VerifyByCrcOverride ?? SettingsStore.Current.VerifyByCrc,
             profile.SkipHiddenSystemOverride ?? SettingsStore.Current.SkipHiddenSystem,
             profile.BufferSizeKbOverride ?? SettingsStore.Current.DefaultBufferSizeKb,
-            profile.FlushAfterFileOverride ?? SettingsStore.Current.DefaultFlushAfterFile));
+            profile.FlushAfterFileOverride ?? SettingsStore.Current.DefaultFlushAfterFile,
+             profile.FastSmallFileCopyOverride ?? SettingsStore.Current.DefaultFastCopy));
  
         session.FileWatcher.FileChanged += path => OnFileChanged(session, path);
         session.FileWatcher.FileDeleted += path => OnFileDeleted(session, path);
@@ -194,17 +195,29 @@ public sealed class BackupOrchestrator : IDisposable
 
         // Глобальные значения используем как базу; тест уточняет только те поля,
         // которые пользователь ещё не задавал явно (null).
-        profile.MirrorModeOverride ??= true;
-        profile.VerifyByCrcOverride ??= (mbps > 0 && mbps < 25);
-        profile.LiveWatchOverride ??= (fileCount < 3000);
-        profile.SkipHiddenSystemOverride ??= true;
-        profile.BufferSizeKbOverride ??= (mbps >= 60 ? 8192 : (mbps >= 20 ? 4096 : 1024));
-        profile.FlushAfterFileOverride ??= true;
+        // Тест подбирает только размер буфера чтения/записи. Остальные параметры
+        // (зеркало, CRC, skip, live watch, flush, fast copy) остаются как задал пользователь.
+        if (profile.BufferSizeKbOverride is null)
+        {
+            // Эмпирические диапазоны для внешних USB-накопителей (см. замеры скорости чтения).
+            //  - медленные USB 2.0 / старые контроллеры: небольшой буфер снижает накладные расходы
+            //  - быстрые USB 3.x / SSD-флешки: larger chunk лучше насыщает шину и контроллер NAND
+            profile.BufferSizeKbOverride = mbps switch
+            {
+                <= 0 => 4096,
+                < 5 => 512,
+                < 15 => 1024,
+                < 30 => 2048,
+                < 70 => 4096,
+                < 150 => 8192,
+                < 300 => 16384,
+                _ => 16384,
+            };
+        }
 
         AppLog.Info(
             $"Тест флешки {profile.Label}: файлов={fileCount}, свободно={freeBytes / 1024 / 1024}MB, " +
-            $"скорость={mbps:F1}MB/s, CRC={(profile.VerifyByCrcOverride == true)}, " +
-            $"LiveWatch={(profile.LiveWatchOverride == true)}");
+            $"скорость={mbps:F1}MB/s, буфер={(profile.BufferSizeKbOverride ?? 0)}КБ");
 
         progress?.Report(new SyncProgress(letter, 100, 100, 0, 0, 0, 100, "", SyncPhase.Testing) { DriveName = driveName });
     }
@@ -557,6 +570,7 @@ public sealed class BackupOrchestrator : IDisposable
                 }
 
                 int done = 0;
+                var wipeSw = Stopwatch.StartNew();
                 progress?.Report(new SyncProgress(driveLetter, 0, totalFiles, 0, 0, 0, totalFiles, "", SyncPhase.Wipe) { DriveName = driveNameWipe });
 
                 if (Directory.Exists(profile.BackupPath) && files.Count > 0)
@@ -567,10 +581,22 @@ public sealed class BackupOrchestrator : IDisposable
                         {
                             System.IO.File.Delete(file);
                             done++;
-                            progress?.Report(new SyncProgress(driveLetter, done, totalFiles, 0, 0, done, totalFiles, "", SyncPhase.Wipe) { DriveName = driveNameWipe });
+
+                            // Прогресс удаления не должен душить UI-поток: отчитываемся
+                            // батчами (каждые 128 файлов или каждые 150 мс).
+                            if (progress is not null &&
+                                (done % 128 == 0 || wipeSw.ElapsedMilliseconds >= 150 || done == totalFiles))
+                            {
+                                progress.Report(new SyncProgress(driveLetter, done, totalFiles, 0, 0, done, totalFiles, "", SyncPhase.Wipe) { DriveName = driveNameWipe });
+                                wipeSw.Restart();
+                            }
                         }
                         catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить файл: " + file); }
                     }
+
+                    // Финальный отчёт после цикла (если последний батч не совпал с % 128).
+                    if (progress is not null && done > 0 && done != totalFiles)
+                        progress.Report(new SyncProgress(driveLetter, done, totalFiles, 0, 0, done, totalFiles, "", SyncPhase.Wipe) { DriveName = driveNameWipe });
 
                     var dirs = Directory.EnumerateDirectories(profile.BackupPath, "*", SearchOption.AllDirectories)
                         .OrderByDescending(d => d.Length).ToList();
