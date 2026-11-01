@@ -442,31 +442,48 @@ public static class UpdateService
 
     public static bool VerifyAuthenticode(string filePath) => WinTrust.Verify(filePath);
 
-    public static void ApplyUpdate(string installerPath)
+    /// <summary>
+    /// Внутренняя механика запуска установщика (через cmd с задержкой).
+    /// Используется и в продакшен-пути (после WinTrust), и во временных тестах.
+    /// </summary>
+    public static bool ApplyUpdateCore(string installerPath)
+    {
+        try
+        {
+            // Установщик запускается отдельным cmd с задержкой ~2 с, чтобы дать
+            // приложению завершить штатную очистку и освободить файлы до копирования.
+            var psi = new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c timeout 2 >nul & \"{installerPath}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+            Process.Start(psi);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, "Не удалось запустить установщик");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Запускает скачанный установщик в detached-процессе (через cmd с задержкой),
+    /// чтобы инсталлятор не зависел от времени жизни текущего процесса.
+    /// Возвращает true, если процесс установщика удалось запустить.
+    /// </summary>
+    public static bool ApplyUpdate(string installerPath)
     {
         // SEC: A-02 — проверка Authenticode перед запуском.
         if (!WinTrust.Verify(installerPath))
         {
             AppLog.Warn("SEC A-02: ApplyUpdate отменён — подпись недействительна: " + installerPath);
-            return;
+            return false;
         }
 
-        try
-        {
-            var psi = new ProcessStartInfo(installerPath)
-            {
-                Arguments = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
-                UseShellExecute = true,
-                Verb = "open",
-            };
-            Process.Start(psi);
-        }
-        catch (Exception ex)
-        {
-            AppLog.Error(ex, "Не удалось запустить установщик");
-            return;
-        }
-
-        Environment.Exit(0);
+        return ApplyUpdateCore(installerPath);
     }
 }

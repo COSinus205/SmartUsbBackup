@@ -360,19 +360,53 @@ public sealed class BackupOrchestrator : IDisposable
         StateChanged?.Invoke();
     }
 
-    public void Dispose()
+    public async Task DisposeAsync()
     {
-        // Отменяем все активные копирования: при выходе из трея ни один поток
-        // не должен продолжать писать на диск.
+        // 1. Отменяем все активные копирования: ни один поток
+        //    не должен продолжать писать на диск.
         foreach (var cts in _fullSyncs.Values)
         {
             try { cts.Cancel(); } catch { }
         }
         _fullSyncs.Clear();
-        _syncTasks.Clear();
 
-        foreach (var s in _sessions.Values) s.Dispose();
+        // 2. Дожидаемся завершения выполнявшихся задач (с таймаутом,
+        //    чтобы процесс гарантированно не завис на остановленном I/O).
+        var pendingTasks = _syncTasks.Values.ToList();
+        _syncTasks.Clear();
+        if (pendingTasks.Count > 0)
+        {
+            try
+            {
+                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(3));
+                var allTasks = Task.WhenAll(pendingTasks);
+                await Task.WhenAny(allTasks, timeoutTask).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Ошибки отдельных задач не должны ломать выход приложения.
+            }
+        }
+
+        // 3. Освобождаем сессии (watcher'ы, CTS).
+        foreach (var s in _sessions.Values)
+        {
+            try { s.Dispose(); } catch { }
+        }
         _sessions.Clear();
+    }
+
+    public void Dispose()
+    {
+        // Синхронная обёртка (для IDisposable) поверх асинхронной очистки.
+        try
+        {
+            DisposeAsync().GetAwaiter().GetResult();
+        }
+        catch
+        {
+            // При штатном выходе ошибка очистки не должна блокировать процесс.
+        }
     }
 }
 

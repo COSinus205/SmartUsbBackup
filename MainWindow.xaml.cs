@@ -798,7 +798,14 @@ public sealed partial class MainWindow : Window
             dlg.Title = "Установка";
             dlg.Content = "Запуск инсталлятора…";
             await Task.Delay(400);
-            UpdateService.ApplyUpdate(path);
+            if (UpdateService.ApplyUpdate(path))
+            {
+                await PerformShutdownForUpdate();
+            }
+            else
+            {
+                await ShowInfoAsync("Обновления", "Не удалось запустить установщик.");
+            }
         }
         catch (Exception ex)
         {
@@ -924,6 +931,27 @@ public sealed partial class MainWindow : Window
         }
         catch { /* falls through to restore */ }
         RestoreWindow();
+    }
+
+    /// <summary>
+    /// Штатное завершение при автообновлении: отмена фоновых задач,
+    /// освобождение трея/Mutex и выход приложения. Установщик уже запущен
+    /// отвязанно (с задержкой), поэтому этот процесс можно безопасно убить.
+    /// </summary>
+    private async Task PerformShutdownForUpdate()
+    {
+        AppLog.Info("Обновление: штатное завершение приложения");
+
+        _isExiting = true;
+
+        try { await _orchestrator.DisposeAsync(); } catch { /* не блокируем выход */ }
+        try { _tray?.Dispose(); } catch { }
+        try { App.ReleaseMutex(); } catch { }
+
+        Application.Current.Exit();
+
+        // Страховка: если цикл сообщений не завершился сам — убиваем процесс.
+        _ = Task.Delay(1500).ContinueWith(_ => Environment.Exit(0));
     }
 
     /// <summary>«Выход» в меню трея: останавливаем всё и завершаем процесс.</summary>

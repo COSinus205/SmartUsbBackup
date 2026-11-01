@@ -58,4 +58,16 @@ public partial class App : Application
             _window.Activate();
         // при -hidden окно остаётся скрытым: живёт иконка в трее + WM_DEVICECHANGE
     }
+
+    /// <summary>
+    /// Освобождает Mutex единственного экземпляра до завершения процесса.
+    /// Вызывается перед выходом при автообновлении, чтобы post-install запуск
+    /// приложения не упирался в удержанный мьютекс.
+    /// </summary>
+    public static void ReleaseMutex()
+    {
+        try { _singleInstanceMutex?.ReleaseMutex(); } catch { /* уже отпущен/не наш поток */ }
+        try { _singleInstanceMutex?.Dispose(); } catch { }
+        _singleInstanceMutex = null;
+    }
 }
