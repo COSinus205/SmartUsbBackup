@@ -185,6 +185,7 @@ public sealed class SafeRemovalStateTests
         File.WriteAllText(path, "a");
         var s1 = BackupOrchestrator.ComputePollSignature(root);
 
+        Thread.Sleep(20);
         File.WriteAllText(path, "b");
         var s2 = BackupOrchestrator.ComputePollSignature(root);
 
