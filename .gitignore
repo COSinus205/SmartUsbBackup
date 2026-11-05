@@ -4,3 +4,59 @@ installer/dist/
 *.user
 .vs/
 *.log
+
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+build/
+bld/
+[Oo]bj/
+[Bb]in/
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+# Test results
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+*.coveragexml
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+!packages/build/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# ReSharper / Rider
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Installer
+installer/dist/
+installer/Output/
+
+# Local tools (ejecttest harness, etc.)
+tools/ejecttest/
+ejecttest/
+*.ejecttest.*
+
+# Logs
+*.log
+logs/

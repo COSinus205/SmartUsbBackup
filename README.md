@@ -1,11 +1,19 @@
-﻿# Smart USB Backup 3.0 (WinUI 3)
+﻿# Smart USB Backup 4.3.0 (WinUI 3)
 
-Современное приложение для зеркального резервного копирования USB-флешек с нулевой нагрузкой на процессор в режиме ожидания.
+![CI](https://github.com/COSinus205/SmartUsbBackup/actions/workflows/dotnet.yml/badge.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![.NET 8](https://img.shields.io/badge/.NET-8-512BD4)
+![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D4)
+
+Современное приложение для зеркального резервного копирования USB-флешек. В режиме ожидания приложение не держит постоянных дескрипторов на флешке; изменения отслеживаются лёгким polling с настраиваемым интервалом (по умолчанию 30 секунд), что обеспечивает корректную работу «Безопасного извлечения» в Windows.
+
+> **Версия 4.3.0** — функциональное изменение (minor bump по SemVer): меняется поведение приложения в простое (polling вместо постоянного watcher), добавляются новые настройки. Обратная совместимость с настройками 4.2.0 сохранена — старые settings.json десериализуются с дефолтными значениями новых полей.
+
+> **4.3.0 в разработке.** Последний стабильный релиз — [v4.2.0](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.2.0). После публикации 4.3.0 ссылки на скачивание будут обновлены.
 
 <div align="center">
   <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.2.0">
     <img src="https://img.shields.io/badge/Download%20installer-4.2.0-blue?style=for-the-badge" alt="Download Smart USB Backup 4.2.0 installer">
-  </a>
   </a>
 </div>
 
@@ -44,9 +52,35 @@ dotnet build -c Release
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\SmartUsbBackup.iss
 ```
 
-Результат: `installer/dist/SmartUsbBackup-Setup-4.2.0.exe`.
+Результат: `installer/dist/SmartUsbBackup-Setup-4.3.0.exe`.
 
 Установка per-user, без прав администратора. При удалении предлагается выбрать, какие копии флешек удалить.
+
+## Безопасное извлечение (safe-remove)
+
+- `FileSystemWatcher` не создаётся в конструкторе сессии и не удерживается на флешке постоянно. Watcher открывается только на время активной синхронизации и закрывается после её завершения.
+- В простое отслеживание изменений идёт через лёгкий **polling**: периодический обход корня и папок первого уровня с расчётом подписи (количество элементов, `LastWriteTime`, размер). Хэндлы на том не удерживаются, поэтому «Безопасное извлечение» в Windows в типичном сценарии «вставил — извлёк» проходит без «Устройство занято».
+- При получении `DBT_DEVICEQUERYREMOVE` / `DBT_DEVICEQUERYREMOVEFAILED` / `DBT_DEVICEQUERYREMOVEPENDING` приложение останавливает синхронизацию и освобождает хэндлы в пределах таймаута 1500 мс (`BROADCAST_QUERY_DENY` при превышении).
+- `ConnectedSession` идемпотентен при повторном `Dispose`; `ConnectedSession.FileWatcher` может быть `null` (watcher создаётся лениво). `RunDriveSettingsTest` принимает session-scoped `CancellationToken`, отменяемый при `BeginDetachForSafeRemoval`.
+
+Если Windows всё равно показывает «Устройство занято»:
+
+- Откройте Resource Monitor (resmon) → вкладка CPU → «Связанные дескрипторы», найдите процессы, держащие файлы на букве диска флешки, и закройте их.
+- Либо используйте `handle.exe -a -u D:` из Sysinternals, чтобы найти и закрыть хэндлы.
+- Проверьте, что не включена настройка `ForceLegacyWatcher=true` (она только для отладки).
+
+## Настройки
+
+Новые поля `AppSettings` в `settings.json`. Обратная совместимость сохранена — старые файлы десериализуются с дефолтами:
+
+| Настройка | По умолчанию | Назначение |
+|---|---|---|
+| `HandleSafeRemoval` | `true` | Обработка `DBT_DEVICEQUERYREMOVE`: синхронное освобождение хэндлов и отмена sync/watcher. `false` — полный no-op. |
+| `UsePollingInIdle` | `true` | Включить polling в простое. |
+| `PollingIntervalSeconds` | `30` (мин. `5`) | Интервал polling в секундах. |
+| `ForceLegacyWatcher` | `false` | Только для отладки/возврата старого поведения (постоянный `FileSystemWatcher`). |
+
+Остальные настройки (зеркало, CRC, live-watch и т.д.) — см. `Core/Settings.cs`.
 
 ## Структура проекта
 
@@ -66,23 +100,30 @@ dotnet build -c Release
 | `Sync/BackupOrchestrator.cs` | Оркестрация синхронизации (подключение/отключение, sync all/one, wipe). |
 | `Sync/FileSyncService.cs` | Копирование файлов (ArrayPool, `.tmp`, Move, CRC32). |
 | `Sync/Crc32.cs` | Расчёт CRC32. |
-| `Usb/UsbDeviceWatcher.cs` | `WM_DEVICECHANGE` через subclass окна (без polling). |
-| `Usb/UsbFileWatcher.cs` | `FileSystemWatcher` для live-watch. |
+| `Usb/UsbDeviceWatcher.cs` | `WM_DEVICECHANGE` через subclass окна. |
+| `Usb/UsbFileWatcher.cs` | `FileSystemWatcher` для live-watch (создаётся лениво). |
 | `Tray/NativeTrayIcon.cs` | Трей: `Shell_NotifyIcon`, меню, balloon. |
 | `Interop/NativeMethods.cs` | Win32-interop/helper'ы (ShowWindow, SetForegroundWindow и др.). |
 | `Interop/WindowMinSize.cs` | Минимальный размер окна через `WM_GETMINMAXINFO`. |
+| `Properties/AssemblyInfo.cs` | `InternalsVisibleTo("SmartUsbBackup.Tests")`. |
+| `SmartUsbBackup.Tests/` | xUnit-тесты: 71 тестовый случай (30 `[Fact]`, 7 `[Theory]`/41 `[InlineData]`). |
 | `installer/SmartUsbBackup.iss` | Скрипт Inno Setup (per-user install, деинсталляция, Pascal Script). |
-| `installer/dist/SmartUsbBackup-Setup-4.2.0.exe` | Собранный установщик (релиз). |
+| `installer/dist/SmartUsbBackup-Setup-4.3.0.exe` | Собранный установщик (релиз). |
+| `CHANGELOG.md` | История изменений. |
+
+> Тестовый харнесс `ejecttest` **не входит в репозиторий**; для локальных копий действуют правила `.gitignore` (`tools/ejecttest/`, `ejecttest/`, `*.ejecttest.*`).
 
 ## CI / Сборка
 
-![CI](https://github.com/COSinus205/SmartUsbBackup/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/COSinus205/SmartUsbBackup/actions/workflows/dotnet.yml/badge.svg)
 
 Запуск тестов локально:
 
 ```bat
 dotnet test SmartUsbBackup.Tests/SmartUsbBackup.Tests.csproj
 ```
+
+Все 71 тестовый случай (30 `[Fact]` + 41 `[InlineData]` в 7 `[Theory]`).
 
 Сборка без Visual Studio:
 
@@ -105,7 +146,12 @@ dotnet build SmartUsbBackup.WinUI.csproj -c Release -p:Platform=x64
 
 Такие флешки получают профиль `NOSERIAL-XXXXXXXX` на основе метки тома; две разные флешки без серийника и с одинаковой меткой могут слиться в один профиль.
 
+## Документация
+
+- [CHANGELOG.md](CHANGELOG.md) — история изменений.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — как собрать, запустить тесты и собрать установщик.
+- [SECURITY.md](SECURITY.md) — политика безопасности.
+
 ## Лицензия
 
 MIT.
-
