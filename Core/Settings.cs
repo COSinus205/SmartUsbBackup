@@ -140,6 +140,22 @@ public sealed class AppSettings
     [JsonPropertyName("liveWatch")]
     public bool LiveWatch { get; set; } = false;
 
+    /// <summary>
+    /// Обработка Windows-запроса безопасного извлечения тома (DBT_DEVICEQUERYREMOVE):
+    /// синхронное освобождение хэндлов и cancel sync/watcher. false = полный no-op, только TRUE.
+    /// </summary>
+    [JsonPropertyName("handleSafeRemoval")]
+    public bool HandleSafeRemoval { get; set; } = true;
+
+    [JsonPropertyName("pollingIntervalSeconds")]
+    public int PollingIntervalSeconds { get; set; } = 30;
+
+    [JsonPropertyName("usePollingInIdle")]
+    public bool UsePollingInIdle { get; set; } = true;
+
+    [JsonPropertyName("forceLegacyWatcher")]
+    public bool ForceLegacyWatcher { get; set; } = false;
+
     /// <summary>Список известных флешек.</summary>
     [JsonPropertyName("drives")]
     public List<DriveProfile> Drives { get; set; } = new();

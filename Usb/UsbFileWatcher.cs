@@ -31,6 +31,7 @@ public sealed class UsbFileWatcher : IDisposable
     public event Action? OverflowDetected;
 
     private readonly FileSystemWatcher _fsw;
+    public bool EnableRaisingEvents { set { _fsw.EnableRaisingEvents = value; } }
     private readonly string _sourceDir;
 
     // словарь «относительный путь → признак: надо копировать»

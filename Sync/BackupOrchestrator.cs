@@ -39,6 +39,9 @@ public sealed class BackupOrchestrator : IDisposable
     // дождаться остановки копирования, а не удалять папку «из-под» активной записи.
     private readonly ConcurrentDictionary<string, Task> _syncTasks = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Набор флешек, находящихся в фазе QUERYREMOVE-detach (по букве диска).</summary>
+    private readonly ConcurrentDictionary<string, byte> _detachingDrives = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>Событие прогресса для UI (маршалинг в поток UI — задача Main-формы).</summary>
     public event Action<ConnectedSession, SyncProgress>? ProgressChanged;
 
@@ -65,12 +68,40 @@ public sealed class BackupOrchestrator : IDisposable
         var profile = SettingsStore.GetOrCreate(e.Serial, e.VolumeLabel);
         profile.DriveLetter = e.DriveLetter;
 
-        // Авто-тест настроек при первом подключении (только чтение, безопасно).
+        var session = new ConnectedSession(e.DriveLetter, profile, new FileSyncService(
+            profile.MirrorModeOverride ?? SettingsStore.Current.MirrorMode,
+            profile.VerifyByCrcOverride ?? SettingsStore.Current.VerifyByCrc,
+            profile.SkipHiddenSystemOverride ?? SettingsStore.Current.SkipHiddenSystem,
+            profile.BufferSizeKbOverride ?? SettingsStore.Current.DefaultBufferSizeKb,
+            profile.FlushAfterFileOverride ?? SettingsStore.Current.DefaultFlushAfterFile,
+             profile.FastSmallFileCopyOverride ?? SettingsStore.Current.DefaultFastCopy));
+
+        if (SettingsStore.Current.ForceLegacyWatcher)
+        {
+            session.FileWatcher = new UsbFileWatcher(session.SourceRoot);
+            WireFileWatcher(session);
+        }
+
+        _sessions[$"{e.DriveLetter}"] = session;
+
+        if (!SettingsStore.Current.ForceLegacyWatcher && SettingsStore.Current.UsePollingInIdle)
+        {
+            session.LastPollSignature = ComputePollSignature(session.SourceRoot);
+            StartPolling(session);
+        }
+
+        // Авто-тест настроек при первом подключении (только чтение, безопасно) —
+        // выполняется внутри lifetime сессии, чтобы detach мог отменить чтение по DetachCts.
         if (SettingsStore.Current.AutoTestNewDrives && !profile.SettingsTested)
         {
             try
             {
-                await RunDriveSettingsTest(profile, e.DriveLetter, progress);
+                await Task.Delay(2000, session.DetachCts.Token);
+                await RunDriveSettingsTest(profile, e.DriveLetter, progress, session.DetachCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                AppLog.Warn("Авто-тест настроек прерван из-за извлечения флешки");
             }
             catch (Exception ex)
             {
@@ -85,29 +116,6 @@ public sealed class BackupOrchestrator : IDisposable
             profile.SettingsTested = true;
             SettingsStore.Save();
         }
-
-        var session = new ConnectedSession(e.DriveLetter, profile, new FileSyncService(
-            profile.MirrorModeOverride ?? SettingsStore.Current.MirrorMode,
-            profile.VerifyByCrcOverride ?? SettingsStore.Current.VerifyByCrc,
-            profile.SkipHiddenSystemOverride ?? SettingsStore.Current.SkipHiddenSystem,
-            profile.BufferSizeKbOverride ?? SettingsStore.Current.DefaultBufferSizeKb,
-            profile.FlushAfterFileOverride ?? SettingsStore.Current.DefaultFlushAfterFile,
-             profile.FastSmallFileCopyOverride ?? SettingsStore.Current.DefaultFastCopy));
- 
-        session.FileWatcher.FileChanged += path => OnFileChanged(session, path);
-        session.FileWatcher.FileDeleted += path => OnFileDeleted(session, path);
-        // SEC: F-01 — при переполнении буфера FSW запускаем полную синхронизацию.
-        session.FileWatcher.OverflowDetected += () =>
-        {
-            try
-            {
-                if (!session.Profile.Enabled) return;
-                if (_fullSyncs.ContainsKey(session.Letter.ToString())) return;
-                StartFullSync(session);
-            }
-            catch (Exception ex) { AppLog.Error(ex, "[USB] Не удалось запустить полную синхронизацию после overflow"); }
-        };
-        _sessions[$"{e.DriveLetter}"] = session;
 
         AppLog.Info($"Флешка подключена: {e.DriveLetter}: «{profile.Label}» serial={profile.Serial}, резервирование={(profile.Enabled ? "вкл" : "выкл")}");
 
@@ -129,7 +137,7 @@ public sealed class BackupOrchestrator : IDisposable
     /// Считает файлы и измеряет скорость чтения выборки, затем подбирает параметры.
     /// Прогресс выводится через IProgress (в UI он попадает в прогресс-бар).
     /// </summary>
-    private async Task RunDriveSettingsTest(DriveProfile profile, char letter, IProgress<SyncProgress>? progress)
+    internal async Task RunDriveSettingsTest(DriveProfile profile, char letter, IProgress<SyncProgress>? progress, CancellationToken ct = default)
     {
         string driveName = string.IsNullOrWhiteSpace(profile.Label) ? "USB" : profile.Label;
         progress?.Report(new SyncProgress(letter, 0, 100, 0, 0, 0, 100, "", SyncPhase.Testing) { DriveName = driveName });
@@ -160,6 +168,7 @@ public sealed class BackupOrchestrator : IDisposable
 
                 foreach (var path in Directory.EnumerateFiles(letter + ":\\", "*", opts))
                 {
+                    ct.ThrowIfCancellationRequested();
                     if (fileCount >= 5000) break;
                     fileCount++;
                     try
@@ -171,6 +180,7 @@ public sealed class BackupOrchestrator : IDisposable
                             int read;
                             while ((read = fs.Read(buf, 0, buf.Length)) > 0)
                             {
+                                ct.ThrowIfCancellationRequested();
                                 sampleBytes += read;
                                 if (sampleBytes >= 16 * 1024 * 1024) break;
                             }
@@ -183,6 +193,10 @@ public sealed class BackupOrchestrator : IDisposable
                         progress?.Report(new SyncProgress(letter, fileCount, Math.Max(fileCount, 1), 0, 0, 0, Math.Max(fileCount, 1), "", SyncPhase.Testing) { DriveName = driveName });
                     }
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -222,8 +236,186 @@ public sealed class BackupOrchestrator : IDisposable
         progress?.Report(new SyncProgress(letter, 100, 100, 0, 0, 0, 100, "", SyncPhase.Testing) { DriveName = driveName });
     }
 
-    /// <summary>Флешка отсылается (извлекается).</summary>
-    public void OnDriveRemoved(char letter)
+    private void WireFileWatcher(ConnectedSession session)
+    {
+        if (session.FileWatcher is null) return;
+
+        session.FileWatcher.FileChanged += path => OnFileChanged(session, path);
+        session.FileWatcher.FileDeleted += path => OnFileDeleted(session, path);
+        // SEC: F-01 — при переполнении буфера FSW запускаем полную синхронизацию.
+        session.FileWatcher.OverflowDetected += () =>
+        {
+            try
+            {
+                if (!session.Profile.Enabled) return;
+                if (_fullSyncs.ContainsKey(session.Letter.ToString())) return;
+                StartFullSync(session);
+            }
+            catch (Exception ex) { AppLog.Error(ex, "[USB] Не удалось запустить полную синхронизацию после overflow"); }
+        };
+    }
+
+    private void EnsureWatcher(ConnectedSession session)
+    {
+        lock (session.SyncRoot)
+        {
+            if (session.AttachmentState != DriveAttachmentState.Attached) return;
+            if (session.FileWatcher is not null) return;
+            session.FileWatcher = new UsbFileWatcher(session.SourceRoot);
+        }
+        WireFileWatcher(session);
+    }
+
+    internal static IEnumerable<char> DriveLetterFromUnitMask(uint mask)
+    {
+        for (int bit = 0; bit < 26; bit++)
+        {
+            if ((mask & (1u << bit)) == 0) continue;
+            yield return (char)('A' + bit);
+        }
+    }
+
+    private void CloseWatcher(ConnectedSession session)
+    {
+        UsbFileWatcher? watcher;
+        lock (session.SyncRoot)
+        {
+            watcher = session.FileWatcher;
+            session.FileWatcher = null;
+        }
+        if (watcher is null) return;
+        try
+        {
+            watcher.EnableRaisingEvents = false;
+            watcher.Dispose();
+        }
+        catch (Exception ex) { AppLog.Error(ex, $"[WATCH] Ошибка закрытия watcher {session.Letter}:"); }
+    }
+
+    private void StartPolling(ConnectedSession session)
+    {
+        if (!SettingsStore.Current.UsePollingInIdle || session.DetachRequested) return;
+        if (session.PollingTimer is not null) return;
+        int interval = Math.Clamp(SettingsStore.Current.PollingIntervalSeconds, 5, 3600);
+        session.PollingTimer = new System.Threading.Timer(_ =>
+        {
+            _ = PollSessionAsync(session);
+        }, null, TimeSpan.FromSeconds(interval), TimeSpan.FromSeconds(interval));
+        session.LastPollSignature = ComputePollSignature(session.SourceRoot);
+        AppLog.Info($"[POLLING] {session.Letter}: baseline taken (root + first level)");
+    }
+
+    private void StopPolling(ConnectedSession session, out int waitMs, out bool completed)
+    {
+        waitMs = 0;
+        completed = true;
+        if (session.PollingTimer is not null)
+        {
+            try { session.PollingTimer.Change(Timeout.Infinite, Timeout.Infinite); } catch { }
+            try { session.PollingTimer.Dispose(); } catch { }
+            session.PollingTimer = null;
+        }
+        var task = session.PollingTask;
+        if (task is not null)
+        {
+            var sw = Stopwatch.StartNew();
+            try { Task.WhenAny(task, Task.Delay(500)).Wait(); }
+            catch { }
+            waitMs = (int)sw.ElapsedMilliseconds;
+            completed = task.IsCompleted;
+        }
+    }
+
+    private async Task PollSessionAsync(ConnectedSession session)
+    {
+        if (!SettingsStore.Current.UsePollingInIdle || session.DetachRequested) return;
+        if (session.AttachmentState != DriveAttachmentState.Attached) return;
+        if (Interlocked.CompareExchange(ref session.PollingInProgress, 1, 0) != 0) return;
+
+        session.PollingTask = Task.Run(() => ComputePollSignature(session.SourceRoot));
+        bool signatureChanged = false;
+        try
+        {
+            string signature = await session.PollingTask;
+            if (session.DetachRequested || !Directory.Exists(session.SourceRoot)) return;
+
+            if (string.IsNullOrEmpty(session.LastPollSignature))
+                session.LastPollSignature = signature;
+            else if (signature != session.LastPollSignature)
+            {
+                signatureChanged = true;
+                session.LastPollSignature = signature;
+                session.PendingChanges = true;
+                var effectiveLiveWatch = session.Profile.LiveWatchOverride ?? SettingsStore.Current.LiveWatch;
+                if (effectiveLiveWatch && session.Profile.Enabled)
+                {
+                    if (!_syncTasks.ContainsKey(session.Letter.ToString()))
+                        StartFullSync(session);
+                }
+                StateChanged?.Invoke();
+                AppLog.Info($"[POLLING] {session.Letter}: signature changed, sync={(effectiveLiveWatch ? "started" : "pending")}");
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, $"[POLLING] {session.Letter} error");
+        }
+        finally
+        {
+            if (signatureChanged)
+            {
+                // baseline already updated above
+            }
+            Interlocked.Exchange(ref session.PollingInProgress, 0);
+            session.PollingTask = null;
+        }
+    }
+
+    internal static string ComputePollSignature(string root)
+    {
+        try
+        {
+            if (!Directory.Exists(root)) return "";
+            var sb = new System.Text.StringBuilder();
+            var optsTop = new EnumerationOptions { IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint };
+            sb.Append(Directory.GetLastWriteTimeUtc(root).Ticks).Append(';');
+            foreach (var path in Directory.EnumerateFiles(root, "*", optsTop))
+            {
+                try
+                {
+                    var fi = new FileInfo(path);
+                    sb.Append(Path.GetFileName(path)).Append(':').Append(fi.Length).Append(':').Append(fi.LastWriteTimeUtc.Ticks).Append(';');
+                }
+                catch { }
+            }
+            foreach (var dir in Directory.EnumerateDirectories(root, "*", optsTop))
+            {
+                sb.Append('D').Append(Path.GetFileName(dir)).Append(':').Append(Directory.GetLastWriteTimeUtc(dir).Ticks).Append(';');
+                try
+                {
+                    foreach (var path in Directory.EnumerateFiles(dir, "*", optsTop))
+                    {
+                        try
+                        {
+                            var fi = new FileInfo(path);
+                            sb.Append(Path.GetFileName(path)).Append(':').Append(fi.Length).Append(':').Append(fi.LastWriteTimeUtc.Ticks).Append(';');
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            return Convert.ToHexString(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(sb.ToString())));
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    /// <summary>Флешка фактически отключена (REMOVECOMPLETE).</summary>
+    public void OnDriveRemoveComplete(char letter)
     {
         var key = letter.ToString();
         if (!_sessions.TryRemove(key, out var session)) return;
@@ -235,15 +427,107 @@ public sealed class BackupOrchestrator : IDisposable
             cts.Dispose();
         }
         _syncTasks.TryRemove(key, out _);
-
+        _detachingDrives.TryRemove(key, out _);
+        StopPolling(session, out _, out _);
         string driveNameRemoved = string.IsNullOrWhiteSpace(session.Profile.Label) ? "USB" : (string.IsNullOrWhiteSpace(session.Profile.Serial) ? session.Profile.Label : $"{session.Profile.Label} [{session.Profile.Serial}]");
         ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Idle) { DriveName = driveNameRemoved });
 
+        session.DetachRequested = false;
         try { session.Dispose(); }
         catch (Exception ex) { AppLog.Error(ex, "Ошибка освобождения сессии {letter}:"); }
 
         StateChanged?.Invoke();
         AppLog.Info($"Флешка отключена: {letter}:");
+    }
+
+    /// <summary>
+    /// Синхронная подготовка к безопасному извлечению.
+    /// </summary>
+    public bool HandleDriveQueryRemove(char letter)
+    {
+        if (!SettingsStore.Current.HandleSafeRemoval)
+        {
+            AppLog.Info($"[SAFE-REMOVE] {letter}: HandleSafeRemoval=false — no-op, TRUE");
+            return true;
+        }
+
+        var key = letter.ToString();
+        if (!_sessions.TryGetValue(key, out var session))
+        {
+            AppLog.Info($"[SAFE-REMOVE] {letter}: foreign/unknown session — TRUE");
+            return true;
+        }
+
+        if (session.AttachmentState == DriveAttachmentState.Detaching)
+        {
+            AppLog.Info($"[SAFE-REMOVE] {letter}: already detaching — TRUE");
+            return true;
+        }
+        if (session.AttachmentState == DriveAttachmentState.Removed)
+            return true;
+
+        var wholeSw = Stopwatch.StartNew();
+
+        int pollMs = 0;
+        bool pollCompleted = true;
+        StopPolling(session, out pollMs, out pollCompleted);
+
+        _detachingDrives.TryAdd(key, 0);
+        session.DetachRequested = true;
+
+        bool watcherTimedOut;
+        int watcherMs;
+        bool watcherOk = session.BeginDetachForSafeRemoval(out watcherMs, out watcherTimedOut);
+
+        int syncMs = 0;
+        bool syncTimedOut = false;
+        if (_syncTasks.TryGetValue(key, out var running))
+        {
+            var syncSw = Stopwatch.StartNew();
+            try { Task.WhenAny(running, Task.Delay(1000)).Wait(); }
+            catch (Exception ex) { AppLog.Error(ex, $"[SAFE-REMOVE] {letter}: ожидание sync завершилось ошибкой"); }
+            syncMs = (int)syncSw.ElapsedMilliseconds;
+            syncTimedOut = !running.IsCompleted;
+        }
+
+        int totalMs = (int)wholeSw.ElapsedMilliseconds;
+        bool success = pollCompleted &&
+            watcherOk && !watcherTimedOut &&
+            !syncTimedOut &&
+            // финальная проверка: никаких незакрытых хэндлов/задач
+            (session.PollingTask == null || session.PollingTask.IsCompleted) &&
+            session.FileWatcher == null &&
+            (!_syncTasks.ContainsKey(key) || _syncTasks[key].IsCompleted);
+
+        AppLog.Info(
+            $"[SAFE-REMOVE] {letter}: pollWait={pollMs} ms{(pollCompleted ? "" : " (TIMEOUT)")} " +
+            $"watcher.Dispose={watcherMs} ms{(watcherTimedOut ? " (TIMEOUT)" : "")}, " +
+            $"syncWait={syncMs} ms{(syncTimedOut ? " (TIMEOUT)" : "")}, total={totalMs} ms -> {(success ? "TRUE" : "DENY")}");
+
+        if (!success)
+            StateChanged?.Invoke();
+
+        return success;
+    }
+
+    public void OnDriveQueryRemoveFailed(char letter)
+    {
+        var key = letter.ToString();
+        _detachingDrives.TryRemove(key, out _);
+
+        if (!_sessions.TryGetValue(key, out var session)) return;
+
+        try { session.CancelDetachAndResume(); }
+        catch (Exception ex) { AppLog.Error(ex, $"[SAFE-REMOVE] {letter}: CancelDetachAndResume error"); }
+
+        if (session.AttachmentState == DriveAttachmentState.Attached)
+            session.DetachRequested = false;
+
+        if (session.AttachmentState != DriveAttachmentState.Removed && SettingsStore.Current.UsePollingInIdle)
+            StartPolling(session);
+
+        StateChanged?.Invoke();
+        AppLog.Info($"[SAFE-REMOVE] {letter}: QUERYREMOVEFAILED → {(session.AttachmentState == DriveAttachmentState.Attached ? "Attached" : "Removed")}");
     }
 
     // =====================================================================
@@ -285,6 +569,7 @@ public sealed class BackupOrchestrator : IDisposable
         }
 
         session.State = SessionState.Syncing;
+        session.PendingChanges = false;
 
         string driveNameSync = string.IsNullOrWhiteSpace(session.Profile.Label) ? "USB" : (string.IsNullOrWhiteSpace(session.Profile.Serial) ? session.Profile.Label : $"{session.Profile.Label} [{session.Profile.Serial}]");
 
@@ -300,12 +585,18 @@ public sealed class BackupOrchestrator : IDisposable
         {
             try
             {
+                if (SettingsStore.Current.ForceLegacyWatcher && session.FileWatcher is null)
+                    session.FileWatcher = new UsbFileWatcher(session.SourceRoot);
+
+                EnsureWatcher(session);
                 var cts = session.CurrentCts!;
                 var result = await session.FsSync.SyncAllAsync(
                     session.SourceRoot, session.BackupPath, progress, cts.Token);
 
                 session.State = result.Error is null ? SessionState.Idle : SessionState.Error;
                 session.LastResult = result.Error ?? $"копий {result.Copied}, удалено {result.Deleted}, пропущено {result.Skipped}";
+                if (result.Error is null)
+                    session.PendingChanges = false;
                 SyncFinished?.Invoke(session, result);
 
                 // После успешного завершения переходим в режим ожидания изменений, если он включён.
@@ -335,6 +626,8 @@ public sealed class BackupOrchestrator : IDisposable
                     if (_fullSyncs.TryGetValue(key, out var c) && c == session.CurrentCts)
                         _fullSyncs.TryRemove(key, out _);
                 }
+                if (!SettingsStore.Current.ForceLegacyWatcher)
+                    CloseWatcher(session);
                 _syncTasks.TryRemove(key, out _);
                 StateChanged?.Invoke();
             }
@@ -624,7 +917,7 @@ public sealed class BackupOrchestrator : IDisposable
         StateChanged?.Invoke();
     }
 
-    public async Task TestDriveSettingsAsync(DriveProfile profile, IProgress<SyncProgress>? progress, bool resetOverrides = true)
+    public async Task TestDriveSettingsAsync(DriveProfile profile, IProgress<SyncProgress>? progress, CancellationToken ct, bool resetOverrides = true)
     {
         if (resetOverrides)
         {
@@ -638,7 +931,7 @@ public sealed class BackupOrchestrator : IDisposable
         }
         try
         {
-            await RunDriveSettingsTest(profile, profile.DriveLetter, progress);
+            await RunDriveSettingsTest(profile, profile.DriveLetter, progress, ct);
             profile.SettingsTested = true;
             SettingsStore.Save();
         }
@@ -681,6 +974,7 @@ public sealed class BackupOrchestrator : IDisposable
         // 3. Освобождаем сессии (watcher'ы, CTS).
         foreach (var s in _sessions.Values)
         {
+            try { StopPolling(s, out _, out _); } catch { }
             try { s.Dispose(); } catch { }
         }
         _sessions.Clear();
@@ -705,19 +999,32 @@ public sealed class BackupOrchestrator : IDisposable
 // =====================================================================
 
 public enum SessionState { Idle, Syncing, Error }
+public enum DriveAttachmentState { Attached, Detaching, Removed }
 
 /// <summary>Логическое «флешка сейчас в системе»: буква, профиль, watcher, сервис копирования.</summary>
 public sealed class ConnectedSession : IDisposable
 {
+    public readonly object SyncRoot = new();
+    private bool _disposed;
+
     public char Letter { get; }
     public DriveProfile Profile { get; }
-    public UsbFileWatcher FileWatcher { get; }
+    public UsbFileWatcher? FileWatcher { get; internal set; }
     public FileSyncService FsSync { get; }
     public CancellationTokenSource? CurrentCts { get; set; }
+    public CancellationTokenSource DetachCts { get; private set; } = new();
 
     public SessionState State { get; set; } = SessionState.Idle;
+    public DriveAttachmentState AttachmentState { get; private set; } = DriveAttachmentState.Attached;
     public string LastResult { get; set; } = "";
 
+    public volatile bool PendingChanges;
+    public volatile int PollingInProgress;
+    internal string LastPollSignature { get; set; } = "";
+    internal System.Threading.Tasks.Task<string>? PollingTask { get; set; }
+    internal System.Threading.Timer? PollingTimer { get; set; }
+    public volatile bool DetachRequested;
+    public System.DateTime LastSuccessfulSyncUtc { get; set; } = System.DateTime.MinValue;
     /// <summary>Корень флешки, например "D:\".</summary>
     public string SourceRoot => $@"{Letter}:\";
 
@@ -729,12 +1036,87 @@ public sealed class ConnectedSession : IDisposable
         Letter = letter;
         Profile = profile;
         FsSync = fsSync;
-        FileWatcher = new UsbFileWatcher(SourceRoot);
+        FileWatcher = null;
+    }
+
+    public bool BeginDetachForSafeRemoval(out int watcherMs, out bool watcherTimedOut)
+    {
+        watcherMs = 0;
+        watcherTimedOut = false;
+
+        lock (SyncRoot)
+        {
+            if (_disposed) return true;
+            if (AttachmentState != DriveAttachmentState.Attached) return true;
+            AttachmentState = DriveAttachmentState.Detaching;
+        }
+
+        try { CurrentCts?.Cancel(); } catch { }
+        try { DetachCts.Cancel(); } catch { }
+
+        if (FileWatcher is not null)
+        {
+            var fw = FileWatcher;
+            FileWatcher = null;
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                var task = Task.Run(() => { try { fw.Dispose(); } catch { } });
+                if (!task.Wait(500))
+                    watcherTimedOut = true;
+            }
+            catch
+            {
+                watcherTimedOut = true;
+            }
+            watcherMs = (int)sw.ElapsedMilliseconds;
+            if (watcherTimedOut)
+                AppLog.Warn($"[SAFE-REMOVE] {Letter}: watcher.Dispose timeout ({watcherMs} ms)");
+            else if (watcherMs > 300)
+                AppLog.Warn($"[SAFE-REMOVE] {Letter}: watcher.Dispose slow ({watcherMs} ms)");
+        }
+
+        return !watcherTimedOut;
+    }
+
+    public void CancelDetachAndResume()
+    {
+        lock (SyncRoot)
+        {
+            if (_disposed) return;
+            if (AttachmentState != DriveAttachmentState.Detaching) return;
+
+            if (!Directory.Exists(SourceRoot))
+            {
+                AttachmentState = DriveAttachmentState.Removed;
+                return;
+            }
+
+            try { CurrentCts?.Dispose(); } catch { }
+            CurrentCts = null;
+            try { DetachCts.Dispose(); } catch { }
+            DetachCts = new CancellationTokenSource();
+            FileWatcher = null;
+            AttachmentState = DriveAttachmentState.Attached;
+        }
     }
 
     public void Dispose()
     {
-        FileWatcher.Dispose();
-        CurrentCts?.Dispose();
+        lock (SyncRoot)
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            try { FileWatcher?.Dispose(); } catch { }
+            FileWatcher = null;
+
+            try { CurrentCts?.Cancel(); } catch { }
+        try { DetachCts.Cancel(); } catch { }
+            try { CurrentCts?.Dispose(); } catch { }
+            CurrentCts = null;
+
+            AttachmentState = DriveAttachmentState.Removed;
+        }
     }
 }

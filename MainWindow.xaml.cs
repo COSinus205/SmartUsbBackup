@@ -348,6 +348,15 @@ public sealed partial class MainWindow : Window
             });
         };
         _orchestrator.StateChanged += () => _dq.TryEnqueue(RefreshList);
+        _orchestrator.SyncFinished += (session, result) =>
+        {
+            if (result.Error is null)
+            {
+                session.LastSuccessfulSyncUtc = DateTime.Now;
+                session.PendingChanges = false;
+            }
+            _dq.TryEnqueue(RefreshList);
+        };
     }
 
     private bool UpdateSyncingState(DriveProfile profile, SyncPhase phase)
@@ -379,6 +388,22 @@ public sealed partial class MainWindow : Window
         // DriveRemoved/Restore приходят прямо из оконной процедуры (UI-поток), но очередь
         // всё равно не помешает (гарантия отсутствия reentrancy в WndProc).
         _usbWatcher.DriveRemoved += l => _dq.TryEnqueue(() => OnDriveRemovedUi(l));
+        _usbWatcher.DriveQueryRemove += letter =>
+        {
+            if (!SettingsStore.Current.HandleSafeRemoval)
+                return true;
+
+            _dq.TryEnqueue(() => SetDriveAttachmentStatus(letter, "Подготовка к извлечению…"));
+            bool ok = _orchestrator.HandleDriveQueryRemove(letter);
+            _dq.TryEnqueue(() =>
+            {
+                SetDriveAttachmentStatus(letter, ok
+                    ? "Можно безопасно извлечь"
+                    : "Подготовка к извлечению…");
+            });
+            return ok;
+        };
+        _usbWatcher.DriveQueryRemoveFailed += letter => _dq.TryEnqueue(() => OnDriveQueryRemoveFailedUi(letter));
         _usbWatcher.RestoreRequested += () => _dq.TryEnqueue(RestoreWindow);
 
         _usbWatcher.Attach(_hwnd);
@@ -404,7 +429,7 @@ public sealed partial class MainWindow : Window
     private void OnDriveRemovedUi(char letter)
     {
         var removedProfile = _orchestrator.ActiveSessions.FirstOrDefault(s => s.Letter == letter)?.Profile;
-        _orchestrator.OnDriveRemoved(letter);
+        _orchestrator.OnDriveRemoveComplete(letter);
         if (removedProfile is not null)
         {
             lock (_driveStateLock)
@@ -419,6 +444,21 @@ public sealed partial class MainWindow : Window
 
         if (IsWindowHidden())
             SafeNotify("Smart USB Backup", "Флешка отключена");
+    }
+
+    private void SetDriveAttachmentStatus(char letter, string text)
+    {
+        foreach (var row in _rows.Where(r => r.Profile.DriveLetter == letter))
+            row.State = text;
+    }
+
+    private void OnDriveQueryRemoveFailedUi(char letter)
+    {
+        SetDriveAttachmentStatus(letter, "Подключена");
+        RefreshList();
+        TxtGlobalStatus.Text = "Извлечение отменено — синхронизация возобновлена";
+        if (IsWindowHidden())
+            SafeNotify("Smart USB Backup", "Извлечение отменено");
     }
 
     private bool IsWindowHidden()
@@ -826,7 +866,15 @@ public sealed partial class MainWindow : Window
                 profile.SettingsTested = false;
 
                 var progress = new Progress<SyncProgress>(p => OnProgress(p));
-                await _orchestrator.TestDriveSettingsAsync(profile, progress, false);
+                var session = _orchestrator.ActiveSessions.FirstOrDefault(s =>
+        ReferenceEquals(s.Profile, profile) ||
+        string.Equals(s.Profile.Serial, profile.Serial, System.StringComparison.OrdinalIgnoreCase));
+if (session is null)
+{
+    TxtGlobalStatus.Text = "Флешка не подключена — тест невозможен.";
+    return;
+}
+await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.Token, false);
 
                 chkMirror.IsChecked = profile.MirrorModeOverride ?? SettingsStore.Current.MirrorMode;
                 chkCrc.IsChecked = profile.VerifyByCrcOverride ?? SettingsStore.Current.VerifyByCrc;
@@ -1258,6 +1306,16 @@ public sealed partial class MainWindow : Window
 
         if (!profile.Enabled) return "Выключено";
         if (session is null) return "Не подключена";
+        if (session.PendingChanges) return "Подключена (ожидает синхронизации)";
+        if (session.LastSuccessfulSyncUtc != DateTime.MinValue)
+        {
+            return session.State switch
+            {
+                SessionState.Syncing => "Резервирование…",
+                SessionState.Error => "Ошибка: " + session.LastResult,
+                _ => "Синхронизировано (" + session.LastSuccessfulSyncUtc.ToString("HH:mm") + ")",
+            };
+        }
         return session.State switch
         {
             SessionState.Syncing => "Резервирование…",
