@@ -9,15 +9,15 @@
 
 > **Версия 4.3.0** — функциональное изменение (minor bump по SemVer): меняется поведение приложения в простое (polling вместо постоянного watcher), добавляются новые настройки. Обратная совместимость с настройками 4.2.0 сохранена — старые settings.json десериализуются с дефолтными значениями новых полей.
 
-> **4.3.0 в разработке.** Последний стабильный релиз — [v4.2.0](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.2.0). После публикации 4.3.0 ссылки на скачивание будут обновлены.
+> **Последний релиз — 4.3.0.**
 
 <div align="center">
-  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.2.0">
-    <img src="https://img.shields.io/badge/Download%20installer-4.2.0-blue?style=for-the-badge" alt="Download Smart USB Backup 4.2.0 installer">
+  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.3.0">
+    <img src="https://img.shields.io/badge/Download%20installer-4.3.0-blue?style=for-the-badge" alt="Download Smart USB Backup 4.3.0 installer">
   </a>
 </div>
 
-> Latest installer: [SmartUsbBackup-Setup-4.2.0.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.2.0)
+> Latest installer: [SmartUsbBackup-Setup-4.3.0.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.3.0)
 
 ## Основные возможности
 
