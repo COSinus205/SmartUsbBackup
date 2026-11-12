@@ -62,7 +62,7 @@ public sealed class BackupOrchestrator : IDisposable
     // =====================================================================
 
     /// <summary>Флешка подключилась.</summary>
-    public async Task<DriveProfile> OnDriveArrivedAsync(UsbDriveEventArgs e, IProgress<SyncProgress>? progress = null)
+    public Task<DriveProfile> OnDriveArrivedAsync(UsbDriveEventArgs e, IProgress<SyncProgress>? progress = null)
     {
         // Профиль по серийному номеру (никогда не по букве диска).
         var profile = SettingsStore.GetOrCreate(e.Serial, e.VolumeLabel);
@@ -90,33 +90,6 @@ public sealed class BackupOrchestrator : IDisposable
             StartPolling(session);
         }
 
-        // Авто-тест настроек при первом подключении (только чтение, безопасно) —
-        // выполняется внутри lifetime сессии, чтобы detach мог отменить чтение по DetachCts.
-        if (SettingsStore.Current.AutoTestNewDrives && !profile.SettingsTested)
-        {
-            try
-            {
-                await Task.Delay(2000, session.DetachCts.Token);
-                await RunDriveSettingsTest(profile, e.DriveLetter, progress, session.DetachCts.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                AppLog.Warn("Авто-тест настроек прерван из-за извлечения флешки");
-            }
-            catch (Exception ex)
-            {
-                AppLog.Error(ex, "Ошибка авто-теста настроек флешки");
-            }
-            profile.SettingsTested = true;
-            SettingsStore.Save();
-        }
-        else if (!profile.SettingsTested)
-        {
-            // Автотест выключен пользователем, считаем глобальные настройки подтверждёнными.
-            profile.SettingsTested = true;
-            SettingsStore.Save();
-        }
-
         AppLog.Info($"Флешка подключена: {e.DriveLetter}: «{profile.Label}» serial={profile.Serial}, резервирование={(profile.Enabled ? "вкл" : "выкл")}");
 
         StateChanged?.Invoke();
@@ -129,7 +102,53 @@ public sealed class BackupOrchestrator : IDisposable
         if (profile.Enabled) StartFullSync(session);
         else AppLog.Info($"Флешка «{profile.Label}» подключена, но её резервирование выключено");
 
-        return profile;
+        // Авто-тест НЕ задерживает подключение: чтение до 16 МБ с флешки занимает
+        // секунды. Тест уходит в фон и запускается после первой синхронизации,
+        // чтобы не конкурировать с копированием за пропускную способность.
+        if (SettingsStore.Current.AutoTestNewDrives && !profile.SettingsTested)
+        {
+            StartAutoTestInBackground(profile, e.DriveLetter, session);
+        }
+        else if (!profile.SettingsTested)
+        {
+            // Автотест выключен пользователем, считаем глобальные настройки подтверждёнными.
+            profile.SettingsTested = true;
+            SettingsStore.Save();
+        }
+
+        return Task.FromResult(profile);
+    }
+
+    /// <summary>
+    /// Фоновый авто-тест новой флешки: ждём завершения первой синхронизации,
+    /// затем читаем выборку файлов и подбираем размер буфера для будущих прогонов.
+    /// </summary>
+    private void StartAutoTestInBackground(DriveProfile profile, char letter, ConnectedSession session)
+    {
+        _ = Task.Run(async () =>
+        {
+            // Токен берём сразу: после detach CTS может быть уже освобождён.
+            var ct = session.DetachCts.Token;
+            try
+            {
+                if (_syncTasks.TryGetValue(letter.ToString(), out var running))
+                    await Task.WhenAny(running, Task.Delay(Timeout.Infinite, ct));
+
+                ct.ThrowIfCancellationRequested();
+                await Task.Delay(2000, ct);
+                await RunDriveSettingsTest(profile, letter, progress: null, ct);
+                profile.SettingsTested = true;
+                SettingsStore.Save();
+            }
+            catch (OperationCanceledException)
+            {
+                AppLog.Warn("Авто-тест настроек прерван из-за извлечения флешки");
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error(ex, "Ошибка авто-теста настроек флешки");
+            }
+        });
     }
 
     /// <summary>
@@ -371,46 +390,95 @@ public sealed class BackupOrchestrator : IDisposable
         }
     }
 
+    /// <summary>
+    /// Дешёвая «подпись» состояния корня флешки и первого уровня вложенности.
+    /// Раньше здесь строилась огромная строка и считался SHA256 — на тысячах
+    /// файлов это давало заметный CPU-спайк каждые 30 секунд. Теперь это один
+    /// проход по каталогам и 64-битный FNV-1a хэш без промежуточных строк.
+    ///
+    /// Важно: mtime каталогов НЕ используется. NTFS обновляет его лениво
+    /// (метка может «доехать» через несколько миллисекунд после создания
+    /// вложенной папки), из-за чего подпись дёргалась без реальных изменений.
+    /// Вместо этого учитываются имена вложенных папок — они меняются
+    /// синхронно и дают ту же чувствительность к появлению/удалению папок.
+    /// </summary>
     internal static string ComputePollSignature(string root)
     {
         try
         {
             if (!Directory.Exists(root)) return "";
-            var sb = new System.Text.StringBuilder();
-            var optsTop = new EnumerationOptions { IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint };
-            sb.Append(Directory.GetLastWriteTimeUtc(root).Ticks).Append(';');
-            foreach (var path in Directory.EnumerateFiles(root, "*", optsTop))
+
+            var opts = new EnumerationOptions { IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint };
+            var rootInfo = new DirectoryInfo(root);
+
+            // FNV-1a: быстрый, без аллокаций. Коллизии для детектора изменений
+            // не опасны — в хэш входят имена, размеры и mtime файлов.
+            ulong hash = 14695981039346656037UL;
+
+            // FileInfo из перечисления каталога уже содержит размер и даты
+            // (берутся из FindFirst/FindNext), т.е. без отдельного syscall на файл.
+            foreach (var fi in rootInfo.EnumerateFiles("*", opts))
             {
-                try
-                {
-                    var fi = new FileInfo(path);
-                    sb.Append(Path.GetFileName(path)).Append(':').Append(fi.Length).Append(':').Append(fi.LastWriteTimeUtc.Ticks).Append(';');
-                }
-                catch { }
+                hash = FnvString(hash, fi.Name);
+                hash = Fnv(hash, fi.Length);
+                hash = Fnv(hash, fi.LastWriteTimeUtc.Ticks);
             }
-            foreach (var dir in Directory.EnumerateDirectories(root, "*", optsTop))
+
+            foreach (var di in rootInfo.EnumerateDirectories("*", opts))
             {
-                sb.Append('D').Append(Path.GetFileName(dir)).Append(':').Append(Directory.GetLastWriteTimeUtc(dir).Ticks).Append(';');
+                hash = Fnv(hash, 0x444952L); // маркер «первый уровень»
+                hash = FnvString(hash, di.Name);
+
                 try
                 {
-                    foreach (var path in Directory.EnumerateFiles(dir, "*", optsTop))
+                    foreach (var fi in di.EnumerateFiles("*", opts))
                     {
-                        try
-                        {
-                            var fi = new FileInfo(path);
-                            sb.Append(Path.GetFileName(path)).Append(':').Append(fi.Length).Append(':').Append(fi.LastWriteTimeUtc.Ticks).Append(';');
-                        }
-                        catch { }
+                        hash = FnvString(hash, fi.Name);
+                        hash = Fnv(hash, fi.Length);
+                        hash = Fnv(hash, fi.LastWriteTimeUtc.Ticks);
+                    }
+
+                    // Имена папок второго уровня: ловят создание/удаление/переименование
+                    // подпапок, не завися от ленивого mtime каталога.
+                    foreach (var nested in di.EnumerateDirectories("*", opts))
+                    {
+                        hash = Fnv(hash, 0x535542L); // маркер «вложенная папка»
+                        hash = FnvString(hash, nested.Name);
                     }
                 }
-                catch { }
+                catch { /* недоступный каталог — пропускаем */ }
             }
-            using var sha = System.Security.Cryptography.SHA256.Create();
-            return Convert.ToHexString(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(sb.ToString())));
+
+            return hash.ToString("X16");
         }
         catch
         {
             return "";
+        }
+    }
+
+    private static ulong Fnv(ulong hash, long value)
+    {
+        unchecked
+        {
+            hash ^= (ulong)value;
+            hash *= 1099511628211UL;
+            return hash;
+        }
+    }
+
+    private static ulong FnvString(ulong hash, string value)
+    {
+        unchecked
+        {
+            foreach (char ch in value)
+            {
+                hash ^= ch;
+                hash *= 1099511628211UL;
+            }
+            hash ^= 0x1F; // разделитель имён, чтобы «ab»+«c» и «a»+«bc» различались
+            hash *= 1099511628211UL;
+            return hash;
         }
     }
 

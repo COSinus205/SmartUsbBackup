@@ -82,7 +82,7 @@ public sealed class FileSyncService
     private readonly bool _useTargetIndexCache;
 
     /// <summary>Кэш метаданных файла (избегаем повторного FileInfo в цикле копирования).</summary>
-    private readonly record struct FileMeta(string Path, long Size, DateTime LastWriteUtc, DateTime CreationUtc);
+    private readonly record struct FileMeta(string Path, long Size, DateTime LastWriteUtc);
 
     public FileSyncService(bool mirror, bool verifyByCrc, bool skipHiddenSystem, int bufferSizeKb = 4096, bool flushAfterFile = true, bool fastSmallFileCopy = false, bool useTargetIndexCache = true)
     {
@@ -137,16 +137,21 @@ public sealed class FileSyncService
 
         progress?.Report(new SyncProgress('\0', 0, sourceFiles.Count, 0, 0, 0, totalBytes, "", SyncPhase.Scanning));
 
-        // Предварительное создание всех целевых каталогов: меньше повторных CreateDirectory
-        // на один и тот же путь для файлов из одной папки.
+        // Предварительное создание всех целевых каталогов + учёт уже созданных:
+        // CreateDirectory — это syscall, не нужно повторять его на каждый файл.
         var targetDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var fm in sourceFiles)
         {
             targetDirs.Add(Path.GetDirectoryName(Path.Combine(targetDir, Path.GetRelativePath(sourceDir, fm.Path)))!);
         }
+        var createdDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var d in targetDirs)
         {
-            try { Directory.CreateDirectory(d); }
+            try
+            {
+                Directory.CreateDirectory(d);
+                createdDirs.Add(d);
+            }
             catch { /* будет повторная попытка перед конкретным файлом */ }
         }
 
@@ -188,28 +193,31 @@ public sealed class FileSyncService
                 }
                 else
                 {
-                    Directory.CreateDirectory(Path.GetDirectoryName(dstPath)!);
+                    var dstDir = Path.GetDirectoryName(dstPath)!;
+                    if (!createdDirs.Contains(dstDir))
+                    {
+                        // Папка ещё не создана (или предварительное создание не удалось):
+                        // повторяем попытку, но не чаще одного раза на каталог.
+                        Directory.CreateDirectory(dstDir);
+                        createdDirs.Add(dstDir);
+                    }
 
-                    // Мелкие файлы выгоднее копировать через Win32/OS CopyFile (быстрее
-                    // за счёт ядра ОС и меньших managed I/O-накладных расходов).
-                    if (_fastSmallFileCopy && srcMeta.Size > 0 && srcMeta.Size <= 4 * 1024 * 1024)
+                    // Мелкие файлы выгоднее копировать силами ядра ОС (CopyFile): меньше
+                    // managed-накладных расходов, а mtime/ctime переносятся автоматически.
+                    bool copiedByOs = _fastSmallFileCopy && srcMeta.Size > 0 && srcMeta.Size <= 4 * 1024 * 1024;
+                    if (copiedByOs)
                     {
                         System.IO.File.Copy(srcPath, dstPath, overwrite: true);
                     }
                     else
                     {
                         await CopyChunkedAsync(srcPath, dstPath, ct);
+
+                        // .tmp → Move сохраняет время записи самого .tmp, поэтому возвращаем
+                        // дату источника: иначе следующий прогон снова сочтёт файл новым.
+                        System.IO.File.SetLastWriteTimeUtc(dstPath, srcMeta.LastWriteUtc);
                     }
 
-                    // Сохраняем метаданные: иначе на следующем запуске mtime целевого файла
-                    // будет «сейчас» и инкрементальное сравнение всегда будет считать файл новым.
-                    System.IO.File.SetLastWriteTimeUtc(dstPath, srcMeta.LastWriteUtc);
-                    try
-                    {
-                        if (srcMeta.CreationUtc != DateTime.MinValue)
-                            System.IO.File.SetCreationTimeUtc(dstPath, srcMeta.CreationUtc);
-                    }
-                    catch { /* не критично */ }
                     copied++;
                     bytesCopied += srcMeta.Size;
                     targetIndex[rel] = srcKey; // копия теперь идентична источнику
@@ -300,6 +308,12 @@ public sealed class FileSyncService
                 progress?.Report(new SyncProgress('\0', 0, totalToPrune, copied, skipped, 0, totalToPrune, "", SyncPhase.Pruning));
 
                 int pruned = 0;
+                var pruneSw = Stopwatch.StartNew();
+
+                // В лог пишем не каждое удаление (при зеркалировании их бывают тысячи),
+                // а одну сводную строку с парой примеров.
+                var mirrorExamples = new List<string>(3);
+
                 foreach (var rel in toDelete)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -311,11 +325,30 @@ public sealed class FileSyncService
                         deleted++;
                         pruned++;
                         if (_useTargetIndexCache) targetIndex.Remove(rel);
-                        AppLog.Info($"[MIRROR] Удалён из бэкапа: {dst}");
-                        progress?.Report(new SyncProgress('\0', pruned, totalToPrune, copied, skipped, pruned, totalToPrune, dst, SyncPhase.Pruning));
+                        if (mirrorExamples.Count < 3) mirrorExamples.Add(dst);
+
+                        // Троттлинг: тысячи удалений не должны «затапливать» UI-поток
+                        // отдельным отчётом на каждый файл.
+                        if (progress is not null && (pruned % 128 == 0 || pruneSw.ElapsedMilliseconds >= 150))
+                        {
+                            progress.Report(new SyncProgress('\0', pruned, totalToPrune, copied, skipped, pruned, totalToPrune, dst, SyncPhase.Pruning));
+                            pruneSw.Restart();
+                        }
                     }
                     catch (Exception ex) { AppLog.Error(ex, $"Не удалось удалить {dst}"); }
                 }
+
+                if (pruned > 0)
+                {
+                    var examples = mirrorExamples.Count > 0
+                        ? "; например: " + string.Join("; ", mirrorExamples)
+                        : "";
+                    AppLog.Info($"[MIRROR] Удалено файлов: {pruned}{examples}");
+                }
+
+                if (progress is not null && pruned > 0 && pruned != totalToPrune)
+                    progress.Report(new SyncProgress('\0', pruned, totalToPrune, copied, skipped, pruned, totalToPrune, "", SyncPhase.Pruning));
+
                 CleanupEmptyDirs(fullTargetDir);
             }
         }
@@ -349,7 +382,6 @@ public sealed class FileSyncService
             await CopyChunkedAsync(srcFullPath, dst, CancellationToken.None);
             var srcInfo = new FileInfo(srcFullPath);
             System.IO.File.SetLastWriteTimeUtc(dst, srcInfo.LastWriteTimeUtc);
-            try { System.IO.File.SetCreationTimeUtc(dst, srcInfo.CreationTimeUtc); } catch { /* не критично */ }
             AppLog.Info($"[WATCH] Обновлён в бэкапе: {dst}");
             return true;
         }
@@ -402,13 +434,13 @@ public sealed class FileSyncService
             var path = fi.FullName;
             try
             {
-                result.Add(new FileMeta(path, fi.Length, fi.LastWriteTimeUtc, fi.CreationTimeUtc));
+                result.Add(new FileMeta(path, fi.Length, fi.LastWriteTimeUtc));
             }
             catch
             {
                 // Файл мог исчезнуть/быть недоступен во время обхода — сохраняем путь,
                 // размер впоследствии будет вычислен при попытке копирования.
-                result.Add(new FileMeta(path, 0, DateTime.MinValue, DateTime.MinValue));
+                result.Add(new FileMeta(path, 0, DateTime.MinValue));
             }
 
             count++;
@@ -544,34 +576,39 @@ public sealed class FileSyncService
     private async Task CopyChunkedAsync(string src, string dst, CancellationToken ct)
     {
         var tmp = dst + ".tmp";
-        var chunk = _bufferSize;
 
         try
         {
             await using (var srcStream = new FileStream(
                 src, FileMode.Open, FileAccess.Read,
                 FileShare.Read | FileShare.Write | FileShare.Delete, // не блокируем открытие пользователем
-                chunk, FileOptions.Asynchronous | FileOptions.SequentialScan))
-            await using (var dstStream = new FileStream(
-                tmp, FileMode.Create, FileAccess.Write, FileShare.None,
-                chunk, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                _bufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
-                var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(chunk);
-                try
+                // Буфер не больше самого файла: не арендуем 4 МБ под файл в 10 КБ.
+                int chunk = (int)Math.Clamp(
+                    Math.Min(_bufferSize, Math.Max(64 * 1024, srcStream.Length)),
+                    64 * 1024, _bufferSize);
+
+                await using var dstStream = new FileStream(
+                    tmp, FileMode.Create, FileAccess.Write, FileShare.None,
+                    chunk, FileOptions.Asynchronous);
                 {
-                    int read;
-                    while ((read = await srcStream.ReadAsync(buffer.AsMemory(0, chunk), ct)) > 0)
+                    var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(chunk);
+                    try
                     {
-                        await dstStream.WriteAsync(buffer.AsMemory(0, read), ct);
+                        int read;
+                        while ((read = await srcStream.ReadAsync(buffer.AsMemory(0, chunk), ct)) > 0)
+                        {
+                            await dstStream.WriteAsync(buffer.AsMemory(0, read), ct);
+                        }
+
+                        // Flush(true) сбрасывает и managed-буфер, поэтому при включённом
+                        // flushAfterFile отдельный FlushAsync не нужен (раньше была двойная работа).
+                        if (_flushAfterFile) dstStream.Flush(true);
+                        else await dstStream.FlushAsync(ct);
                     }
-                    await dstStream.FlushAsync(ct);
-                    if (_flushAfterFile)
-                    {
-                        // Физический сброс буфера ОС на накопитель (надёжнее при выдёргивании).
-                        dstStream.Flush(true);
-                    }
+                    finally { System.Buffers.ArrayPool<byte>.Shared.Return(buffer); }
                 }
-                finally { System.Buffers.ArrayPool<byte>.Shared.Return(buffer); }
             }
 
             // Атомарная замена цели (overwrite: true) — без окна «файла нет».

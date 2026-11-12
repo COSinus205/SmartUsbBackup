@@ -28,6 +28,9 @@ public partial class App : Application
         this.UnhandledException += (_, e) =>
             AppLog.Error(e.Exception, "UI/XAML exception: " + e.Message);
 
+        // Обработчик ProcessExit закрывает файл лога при штатном выходе.
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => AppLog.Shutdown();
+
         // Фоновые исключения не должны молча убивать процесс.
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
             AppLog.Error(e.ExceptionObject as Exception ?? new Exception("unknown"), "Domain exception");

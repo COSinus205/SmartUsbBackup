@@ -111,8 +111,14 @@ public sealed class AppSettings
     [JsonPropertyName("defaultBufferSizeKb")]
     public int DefaultBufferSizeKb { get; set; } = 4096;
 
+    /// <summary>
+    /// Физический сброс (fsync) после каждого файла. По умолчанию выключен:
+    /// на USB-флешках это десятки миллисекунд на файл, т.е. минуты на тысячах
+    /// мелких файлов. Копия и так атомарна (.tmp → Move), поэтому включение
+    /// нужно только для максимальной устойчивости к выдёргиванию флешки.
+    /// </summary>
     [JsonPropertyName("defaultFlushAfterFile")]
-    public bool DefaultFlushAfterFile { get; set; } = true;
+    public bool DefaultFlushAfterFile { get; set; } = false;
 
     /// <summary>
     /// Если включено — мелкие файлы копируются прямо в целевой файл (быстрее,

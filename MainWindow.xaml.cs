@@ -59,6 +59,10 @@ public sealed partial class MainWindow : Window
     private readonly HashSet<DriveProfile> _deletingDrives = new();
     private readonly object _driveStateLock = new();
 
+    // «Есть ли сохранение» — результат кэшируется, чтобы RefreshList не
+    // устраивал по 3–4 обращения к диску на каждый профиль на UI-потоке.
+    private readonly BackupPresenceCache _backupPresence = new();
+
 
     public MainWindow(bool startHidden)
     {
@@ -355,6 +359,8 @@ public sealed partial class MainWindow : Window
                 session.LastSuccessfulSyncUtc = DateTime.Now;
                 session.PendingChanges = false;
             }
+            // После прогона папка бэкапа точно изменилась — кэш presence устарел.
+            _backupPresence.Invalidate(session.Profile.BackupPath);
             _dq.TryEnqueue(RefreshList);
         };
     }
@@ -523,6 +529,7 @@ public sealed partial class MainWindow : Window
 
             SettingsStore.Current.BaseBackupPath = folder.Path;
             SettingsStore.Save();
+            _backupPresence.Clear();   // у всех профилей сменился путь к бэкапу
             TxtBackupPath.Text = folder.Path;
             RefreshList();
         }
@@ -569,6 +576,7 @@ public sealed partial class MainWindow : Window
         finally
         {
             lock (_driveStateLock) { _deletingDrives.Remove(profile); }
+            _backupPresence.Invalidate(profile.BackupPath);   // папка удалена
             await Task.Yield();
             ShowIdle();
             RefreshList();
@@ -586,6 +594,7 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
+            _backupPresence.Clear();   // удалены все папки бэкапов
             ShowIdle();
             RefreshList();
         }
@@ -642,6 +651,7 @@ public sealed partial class MainWindow : Window
 
             SettingsStore.Current.BaseBackupPath = Path.GetFullPath(folder.Path);
             SettingsStore.Save();
+            _backupPresence.Clear();   // у всех профилей сменился путь к бэкапу
             TxtSettingsBackupPath.Text = SettingsStore.Current.BaseBackupPath;
             TxtBackupPath.Text = SettingsStore.Current.BaseBackupPath;
             RefreshList();
@@ -935,6 +945,7 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
                 var folder = await picker.PickSingleFolderAsync();
                 if (folder is null) return;
                 await RelocateDriveBackupAsync(profile, folder.Path, new Progress<SyncProgress>(p => OnProgress(p)));
+                _backupPresence.Clear();   // бэкап перенесён: старый и новый путь изменились
                 backupPathText.Text = $"Папка хранения: {profile.BackupPath}";
                 statusText.Text = BuildDriveStatusText(profile);
                 TxtGlobalStatus.Text = $"Папка хранения «{profile.Label}» изменена.";
@@ -952,6 +963,7 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
             try
             {
                 await RelocateDriveBackupAsync(profile, SettingsStore.Current.BaseBackupPath, new Progress<SyncProgress>(p => OnProgress(p)));
+                _backupPresence.Clear();
                 backupPathText.Text = $"Папка хранения: {profile.BackupPath}";
                 statusText.Text = BuildDriveStatusText(profile);
                 TxtGlobalStatus.Text = $"Папка хранения «{profile.Label}» сброшена к стандартной.";
@@ -1206,6 +1218,10 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
     {
         var profiles = SettingsStore.Current.Drives;
 
+        // Снапшот сессий: ActiveSessions — живая вьюха ConcurrentDictionary,
+        // и раньше она перечислялась по два раза на каждый профиль.
+        var sessions = _orchestrator.ActiveSessions;
+
         // 1) убираем удалённые профили
         for (int i = _rows.Count - 1; i >= 0; i--)
             if (!profiles.Contains(_rows[i].Profile))
@@ -1214,29 +1230,32 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
         for (int i = _rows.Count - 1; i >= 0; i--)
         {
             var proj = _rows[i].Profile;
-            bool present = _orchestrator.ActiveSessions.Any(s =>
-                ReferenceEquals(s.Profile, proj) ||
-                string.Equals(s.Profile.Serial, proj.Serial, StringComparison.OrdinalIgnoreCase));
-            bool keep = proj.Enabled || present || HasBackup(proj.BackupPath) == "Есть сохранение";
-            if (!keep) _rows.RemoveAt(i);
+            if (!(proj.Enabled || IsSessionPresent(sessions, proj) || _backupPresence.HasContent(proj.BackupPath)))
+                _rows.RemoveAt(i);
         }
 
-        // 2) добавляем/сдвигаем/обновляем в порядке настроек
+        // 2) добавляем/обновляем в порядке настроек.
+        // Индекс «профиль → строка»: без линейного поиска на каждый профиль.
+        var rowByProfile = new System.Collections.Generic.Dictionary<DriveProfile, DriveRow>(_rows.Count);
+        foreach (var r in _rows)
+            rowByProfile[r.Profile] = r;
+
         for (int i = 0; i < profiles.Count; i++)
         {
             var profile = profiles[i];
-            bool present = _orchestrator.ActiveSessions.Any(s =>
-                ReferenceEquals(s.Profile, profile) ||
-                string.Equals(s.Profile.Serial, profile.Serial, StringComparison.OrdinalIgnoreCase));
-            bool hasBackup = HasBackup(profile.BackupPath) == "Есть сохранение";
-            if (!(profile.Enabled || present || hasBackup)) continue;
-            var row = _rows.FirstOrDefault(r => ReferenceEquals(r.Profile, profile));
+            bool present = IsSessionPresent(sessions, profile);
 
-            if (row is null)
+            // Path.Combine и обход каталога — по одному разу на профиль,
+            // дальше значения переиспользуются для фильтра и для колонки.
+            string backupPath = profile.BackupPath;
+            bool hasBackup = _backupPresence.HasContent(backupPath);
+            if (!(profile.Enabled || present || hasBackup)) continue;
+
+            if (!rowByProfile.TryGetValue(profile, out var row))
             {
-                var newRow = new DriveRow(profile);
-                _rows.Add(newRow);
-                row = newRow;
+                row = new DriveRow(profile);
+                rowByProfile[profile] = row;
+                _rows.Add(row);
             }
             // Не переставляем строки: коллекция могла потерять элементы из-за фильтра;
             // _rows.Move(currentIndex, i) здесь небезопасен (ArgumentOutOfRange).
@@ -1249,6 +1268,10 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
                 isConnected = System.IO.Directory.Exists(profile.DriveLetter + ":\\");
             row.RefreshState(isConnected ? "Включено" : "Выключено");
 
+            // Directory.Exists(backupPath) — из того же кэша, что и hasBackup,
+            // т.е. без дополнительного обращения к диску.
+            string hasBackupText = _backupPresence.Exists(backupPath) ? "Есть сохранение" : "Нет сохранения";
+
             if (!isConnected)
             {
                 lock (_driveStateLock)
@@ -1257,7 +1280,7 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
                     if (_deletingDrives.Contains(profile)) _deletingDrives.Remove(profile);
                 }
 
-                row.BackupState = Directory.Exists(profile.BackupPath) ? "Есть сохранение" : "Нет сохранения";
+                row.BackupState = hasBackupText;
             }
             else
             {
@@ -1269,8 +1292,7 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
                 }
                 if (deleting) row.BackupState = "Удаляется";
                 else if (syncing) row.BackupState = "Синхронизируется";
-                else if (Directory.Exists(profile.BackupPath)) row.BackupState = "Есть сохранение";
-                else row.BackupState = "Нет сохранения";
+                else row.BackupState = hasBackupText;
             }
         }
 
@@ -1282,20 +1304,23 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
         UpdateTrayText();
     }
 
-    /// <summary>Есть ли в папке бэкапа хотя бы один файл/подпапка.</summary>
-    private static string HasBackup(string backupPath)
+    /// <summary>
+    /// Есть ли активная сессия для профиля. Сравнение по серийнику — только когда
+    /// он реально задан, иначе пустые серийники разных флешек считались бы одной.
+    /// </summary>
+    private static bool IsSessionPresent(
+        System.Collections.Generic.IReadOnlyCollection<ConnectedSession> sessions,
+        DriveProfile profile)
     {
-        try
+        foreach (var s in sessions)
         {
-            return Directory.Exists(backupPath) &&
-                   Directory.EnumerateFileSystemEntries(backupPath).Any()
-                ? "Есть сохранение"
-                : "Нет сохранения";
+            if (ReferenceEquals(s.Profile, profile))
+                return true;
+            if (!string.IsNullOrEmpty(profile.Serial) &&
+                string.Equals(s.Profile.Serial, profile.Serial, StringComparison.OrdinalIgnoreCase))
+                return true;
         }
-        catch
-        {
-            return "Нет сохранения";
-        }
+        return false;
     }
 
     private string ComputeState(DriveProfile profile)
