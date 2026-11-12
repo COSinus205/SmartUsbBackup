@@ -27,7 +27,7 @@ build-installer.bat
 
 Если Inno Setup установлен в нестандартное место, задайте переменную окружения `INNO_SETUP_ISCC` с полным путём к `ISCC.exe`.
 
-Результат — `installer/dist/SmartUsbBackup-Setup-4.3.0.exe` (версия берётся из `installer/SmartUsbBackup.iss`, `#define MyAppVersion`).
+Результат — `installer/dist/SmartUsbBackup-Setup-4.3.1.exe` (версия берётся из `installer/SmartUsbBackup.iss`, `#define MyAppVersion`).
 
 ## Стиль кода
 
