@@ -19,7 +19,7 @@
 ; =====================================================================
 
 #define MyAppName "Smart USB Backup"
-#define MyAppVersion "4.3.1"
+#define MyAppVersion "4.3.2"
 #define MyAppPublisher "Smart USB Backup"
 #define MyAppExeName "SmartUsbBackup.exe"
 #define MyAppId "{C7A5B9E4-2BFE-4D42-A27C-78B9A5C1E1F3}"
@@ -90,7 +90,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 ; ---------- Запуск после установки ----------
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Запустить {#MyAppName}"; Flags: nowait postinstall  runasoriginaluser
+Filename: "{app}\{#MyAppExeName}"; Description: "Запустить {#MyAppName}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 ; ---------- Файлы, удаляемые деинсталлятором автоматически ----------
 ; (Папки бэкапов тут НЕ удаляются — их судьбу решает пользователь в кастомном окне.)
@@ -127,33 +127,78 @@ begin
 end;
 
 // ---------------------------------------------------------------------
-// Сбор списка ПОДПАПОК базовой папки (это и есть копии флешек).
+// Все базы хранения (глобальная + персональные пути профилей).
+// Программа пишет их при каждом сохранении настроек:
+//   BackupRootCount = DWORD, BackupRoot0..N = строки.
+// Если значений нет (старая версия) — используем только базовый путь.
+// ---------------------------------------------------------------------
+function GetBackupRoots: TArrayOfString;
+var
+  RootCount: Cardinal;
+  I, N: Integer;
+  ValueName, RegValue: string;
+begin
+  SetArrayLength(Result, 0);
+  N := 0;
+
+  if RegQueryDWordValue(HKEY_CURRENT_USER, 'Software\SmartUsbBackup',
+       'BackupRootCount', RootCount) and (RootCount > 0) then
+  begin
+    for I := 0 to Integer(RootCount) - 1 do
+    begin
+      ValueName := 'BackupRoot' + IntToStr(I);
+      if RegQueryStringValue(HKEY_CURRENT_USER, 'Software\SmartUsbBackup',
+           ValueName, RegValue) and (Trim(RegValue) <> '') then
+      begin
+        SetArrayLength(Result, N + 1);
+        Result[N] := RegValue;
+        N := N + 1;
+      end;
+    end;
+  end;
+
+  if GetArrayLength(Result) = 0 then
+  begin
+    SetArrayLength(Result, 1);
+    Result[0] := GetBaseBackupPath;
+  end;
+end;
+
+// ---------------------------------------------------------------------
+// Сбор списка ПОДПАПОК всех баз (это и есть копии флешек).
+// BackupFolders хранит ПОЛНЫЕ пути — в окне видно, где лежит копия.
 // ---------------------------------------------------------------------
 procedure CollectBackupSubDirs;
 var
-  Root, Name: string;
+  Roots: TArrayOfString;
+  Root, Name, FullPath: string;
   FindRec: TFindRec;
-  Count: Integer;
+  Count, R: Integer;
 begin
-  Root := GetBaseBackupPath;
+  Roots := GetBackupRoots;
   SetArrayLength(BackupFolders, 0);
   Count := 0;
 
-  if DirExists(Root) then
+  for R := 0 to GetArrayLength(Roots) - 1 do
   begin
-    if FindFirst(Root + '\*', FindRec) then
-    try
-      repeat
-        Name := FindRec.Name;
-        if (Name <> '.') and (Name <> '..') and (Copy(Name, 1, 4) = 'USB_') and DirExists(Root + '\' + Name) then
-        begin
-          SetArrayLength(BackupFolders, Count + 1);
-          BackupFolders[Count] := Name;
-          Count := Count + 1;
-        end;
-      until not FindNext(FindRec);
-    finally
-      FindClose(FindRec);
+    Root := Roots[R];
+    if DirExists(Root) then
+    begin
+      if FindFirst(Root + '\*', FindRec) then
+      try
+        repeat
+          Name := FindRec.Name;
+          if (Name <> '.') and (Name <> '..') and (Copy(Name, 1, 4) = 'USB_') and DirExists(Root + '\' + Name) then
+          begin
+            FullPath := Root + '\' + Name;
+            SetArrayLength(BackupFolders, Count + 1);
+            BackupFolders[Count] := FullPath;
+            Count := Count + 1;
+          end;
+        until not FindNext(FindRec);
+      finally
+        FindClose(FindRec);
+      end;
     end;
   end;
 end;
@@ -182,8 +227,8 @@ begin
   Form := TForm.Create(nil);
   try
     Form.Caption := 'Smart USB Backup — копии флешек';
-    Form.Width := ScaleX(560);
-    Form.Height := ScaleY(360);
+    Form.Width := ScaleX(700);
+    Form.Height := ScaleY(420);
     Form.BorderStyle := bsDialog;
     Form.Position := poScreenCenter;
 
@@ -295,7 +340,7 @@ end;
 // ---------------------------------------------------------------------
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  Root, Folder: string;
+  Folder: string;
   I, DeletedCount, TotalCount: Integer;
 begin
   case CurUninstallStep of
@@ -304,37 +349,46 @@ begin
 
     usPostUninstall:
       begin
-        Root := GetBaseBackupPath;
-        TotalCount := GetArrayLength(BackupFolders);
-        DeletedCount := 0;
-
-        for I := 0 to TotalCount - 1 do
+        // Тихая деинсталляция (обновление, корпоративные сценарии): выбор
+        // пользователя неизвестен, поэтому копии и настройки НЕ трогаем.
+        if UninstallSilent then
         begin
-          if (I < GetArrayLength(BackupChecked)) and BackupChecked[I] then
-          begin
-            Folder := Root + '\' + BackupFolders[I];
-            if DirExists(Folder) then
-            begin
-              DelTree(Folder, True, True, True);
-              DeletedCount := DeletedCount + 1;
-              Log('Удалена копия флешки: ' + Folder);
-            end;
-          end;
-        end;
-
-        BackupKeptCount := TotalCount - DeletedCount;
-
-        // Если пользователь удалил ВСЕ копии (или их не было) — чистим и конфиг:
-        // настройки settings.json, логи, саму папку SmartUsbBackup.
-        // Если копии остались — конфиг сохраняем (при повторной установке
-        // профили флешек и базовый путь продолжат работать).
-        if BackupKeptCount = 0 then
-        begin
-          DelTree(ExpandConstant('{localappdata}\SmartUsbBackup'), True, True, True);
-          Log('Копий не осталось → удалён весь каталог %LocalAppData%\SmartUsbBackup');
+          Log('Тихая деинсталляция: копии флешек и настройки оставлены');
         end
         else
-          Log('Осталось копий: ' + IntToStr(BackupKeptCount) + ' — конфигурация сохранена');
+        begin
+          TotalCount := GetArrayLength(BackupFolders);
+          DeletedCount := 0;
+
+          for I := 0 to TotalCount - 1 do
+          begin
+            if (I < GetArrayLength(BackupChecked)) and BackupChecked[I] then
+            begin
+              // BackupFolders содержит полные пути (глобальная база + персональные).
+              Folder := BackupFolders[I];
+              if DirExists(Folder) then
+              begin
+                DelTree(Folder, True, True, True);
+                DeletedCount := DeletedCount + 1;
+                Log('Удалена копия флешки: ' + Folder);
+              end;
+            end;
+          end;
+
+          BackupKeptCount := TotalCount - DeletedCount;
+
+          // Если пользователь удалил ВСЕ копии (или их не было) — чистим и конфиг:
+          // настройки settings.json, логи, саму папку SmartUsbBackup.
+          // Если копии остались — конфиг сохраняем (при повторной установке
+          // профили флешек и базовый путь продолжат работать).
+          if BackupKeptCount = 0 then
+          begin
+            DelTree(ExpandConstant('{localappdata}\SmartUsbBackup'), True, True, True);
+            Log('Копий не осталось → удалён весь каталог %LocalAppData%\SmartUsbBackup');
+          end
+          else
+            Log('Осталось копий: ' + IntToStr(BackupKeptCount) + ' — конфигурация сохранена');
+        end;
       end;
   end;
 end;

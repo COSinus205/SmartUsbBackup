@@ -15,7 +15,7 @@ dotnet publish -c Release
 dotnet test SmartUsbBackup.Tests/SmartUsbBackup.Tests.csproj
 ```
 
-Все 71 тестовый случай (30 `[Fact]` + 41 `[InlineData]` в 7 `[Theory]`) должны проходить.
+Все 92 тестовых случая (47 `[Fact]` + 45 `[InlineData]` в 8 `[Theory]`) должны проходить.
 
 ## Как собрать установщик
 
@@ -27,7 +27,7 @@ build-installer.bat
 
 Если Inno Setup установлен в нестандартное место, задайте переменную окружения `INNO_SETUP_ISCC` с полным путём к `ISCC.exe`.
 
-Результат — `installer/dist/SmartUsbBackup-Setup-4.3.1.exe` (версия берётся из `installer/SmartUsbBackup.iss`, `#define MyAppVersion`).
+Результат — `installer/dist/SmartUsbBackup-Setup-4.3.2.exe` (версия берётся из `installer/SmartUsbBackup.iss`, `#define MyAppVersion`).
 
 ## Стиль кода
 

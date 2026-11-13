@@ -42,7 +42,6 @@ public sealed partial class MainWindow : Window
     private IntPtr _hwnd;
     private AppWindow _appWindow = null!;
 
-    private readonly bool _startHidden;
     private long _lastProgressPaint;   // throttle отрисовки прогресса (≤5 раз/с)
 
     // true — пользователь выбрал «Выход» в трее: крестик больше НЕ сворачивает окно,
@@ -66,7 +65,9 @@ public sealed partial class MainWindow : Window
 
     public MainWindow(bool startHidden)
     {
-        _startHidden = startHidden;
+        // Признак тихого старта нужен только App (окно не активируется), внутри окна
+        // фактическая видимость определяется через AppWindow.
+        _ = startHidden;
         try
         {
             InitializeComponent();
@@ -122,6 +123,7 @@ public sealed partial class MainWindow : Window
         ChkAutoUpdate.IsChecked = SettingsStore.Current.AutoCheckForUpdates;
         ChkAutoTestNewDrives.IsChecked = SettingsStore.Current.AutoTestNewDrives;
         ChkDefaultEnabled.IsChecked = SettingsStore.Current.DefaultEnabled;
+        ChkIncludeUsbFixed.IsChecked = SettingsStore.Current.IncludeUsbFixedDrives;
 
         ChkDefaultFlush.IsChecked = SettingsStore.Current.DefaultFlushAfterFile;
         ChkDefaultFastCopy.IsChecked = SettingsStore.Current.DefaultFastCopy;
@@ -136,12 +138,18 @@ public sealed partial class MainWindow : Window
             _ => 3,
         };
         TxtSettingsBackupPath.Text = SettingsStore.Current.BaseBackupPath;
-    RefreshStartupCheckboxFromRegistry();
+        RefreshStartupCheckboxFromRegistry();
         TxtBackupPath.Text = SettingsStore.Current.BaseBackupPath;
 
         RefreshList();
         AppLog.CleanupOld();
         EnumerateAlreadyPresentDrives();
+
+        // Авто-проверка обновлений раз в сутки. Планируем здесь, а не в
+        // OnFirstActivated: при старте с -hidden окно не активируется, событие
+        // Activated не приходит — и проверка не выполнялась.
+        _ = Task.Delay(8000).ContinueWith(_ =>
+            _dq.TryEnqueue(() => _ = SafeFireAndForget(CheckForUpdatesAsync(false))));
     }
 
     // =====================================================================
@@ -217,9 +225,6 @@ public sealed partial class MainWindow : Window
         _initialLayoutApplied = true;
         ApplyInitialLayout();
         ApplyTitleBarInsets();
-
-        // Авто-проверка обновлений раз в сутки (разработчик может запретить её в настройках).
-        _ = Task.Delay(8000).ContinueWith(_ => _dq.TryEnqueue(() => _ = SafeFireAndForget(CheckForUpdatesAsync(false))));
     }
 
     /// <summary>
@@ -427,9 +432,18 @@ public sealed partial class MainWindow : Window
         if (profile is not null && !profile.Enabled)
             TxtGlobalStatus.Text = $"Флешка «{e.VolumeLabel}» добавлена. Поставьте галочку «Активна», чтобы начать резервирование.";
 
-        if (IsWindowHidden()) // (только если окно скрыто — иначе пользователь всё видит)
-            SafeNotify("Smart USB Backup",
-                $"Флешка «{e.VolumeLabel}» подключена — синхронизация начата");
+        if (profile is not null && IsWindowHidden()) // (только если окно скрыто — иначе пользователь всё видит)
+        {
+            var arrivedSession = _orchestrator.ActiveSessions.FirstOrDefault(s =>
+                ReferenceEquals(s.Profile, profile) ||
+                string.Equals(s.Profile.Serial, profile.Serial, StringComparison.OrdinalIgnoreCase));
+            string message = arrivedSession?.State == SessionState.Error
+                ? $"Флешка «{e.VolumeLabel}»: {arrivedSession.LastResult}"
+                : profile.Enabled
+                    ? $"Флешка «{e.VolumeLabel}» подключена — синхронизация начата"
+                    : $"Флешка «{e.VolumeLabel}» подключена — включите «Активна» для резервирования";
+            SafeNotify("Smart USB Backup", message);
+        }
     }
 
     private void OnDriveRemovedUi(char letter)
@@ -487,12 +501,16 @@ public sealed partial class MainWindow : Window
         {
             try
             {
-                foreach (var drive in DriveInfo.GetDrives()
-                             .Where(d => d.DriveType == DriveType.Removable && d.IsReady))
+                foreach (var drive in DriveInfo.GetDrives().Where(d => d.IsReady))
                 {
-                    var q = UsbDeviceWatcher.QueryDrive(drive.Name[0], retry: 1, delayMs: 0);
+                    char letter = drive.Name[0];
+                    if (!UsbDeviceWatcher.IsEligibleDrive(letter, SettingsStore.Current.IncludeUsbFixedDrives))
+                        continue;
+
+                    var q = UsbDeviceWatcher.QueryDrive(letter, retry: 1, delayMs: 0,
+                        includeFixed: SettingsStore.Current.IncludeUsbFixedDrives);
                     if (q is not null)
-                        _usbWatcher.RaiseArrived(drive.Name[0], q.Value.VolumeLabel, q.Value.Serial);
+                        _usbWatcher.RaiseArrived(letter, q.Value.VolumeLabel, q.Value.Serial);
                 }
             }
             catch (Exception ex)
@@ -527,17 +545,127 @@ public sealed partial class MainWindow : Window
             var folder = await picker.PickSingleFolderAsync();
             if (folder is null) return;
 
-            SettingsStore.Current.BaseBackupPath = folder.Path;
-            SettingsStore.Save();
-            _backupPresence.Clear();   // у всех профилей сменился путь к бэкапу
-            TxtBackupPath.Text = folder.Path;
-            RefreshList();
+            await ChangeGlobalBackupPathAsync(folder.Path);
         }
         catch (Exception ex)
         {
             AppLog.Error(ex, "Не удалось выбрать папку бэкапов");
             await ShowInfoAsync("Ошибка", "Не удалось открыть диалог выбора папки:\n" + ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Проверяет выбранную базовую папку: канонический путь, не системная папка,
+    /// не корень и не папка на подключённой флешке. При ошибке показывает
+    /// пояснение и возвращает null.
+    /// </summary>
+    private async Task<string?> ValidateChosenBaseAsync(string chosenPath)
+    {
+        var canonical = PathSafety.CanonicalizeBase(chosenPath);
+        if (canonical is null)
+        {
+            await ShowInfoAsync("Недопустимая папка",
+                "Нельзя использовать корень диска, системные папки (Windows/Program Files) " +
+                "или папку пользователя. Выберите другую папку.");
+            return null;
+        }
+
+        foreach (var session in _orchestrator.ActiveSessions)
+        {
+            if (PathSafety.IsSameVolume(canonical, session.SourceRoot) ||
+                PathSafety.IsInsideOrEqual(session.SourceRoot, canonical))
+            {
+                await ShowInfoAsync("Недопустимая папка",
+                    "Выбранная папка находится на подключённой флешке. " +
+                    "Хранить бэкап на том же носителе нельзя — выберите другую папку.");
+                return null;
+            }
+        }
+
+        return canonical;
+    }
+
+    /// <summary>
+    /// Смена глобальной папки хранения: проверка пути, предложение перенести
+    /// существующие копии, затем сохранение настройки и обновление UI.
+    /// </summary>
+    private async Task ChangeGlobalBackupPathAsync(string chosenPath)
+    {
+        var canonical = await ValidateChosenBaseAsync(chosenPath);
+        if (canonical is null) return;
+
+        var oldBase = SettingsStore.Current.BaseBackupPath;
+        if (string.Equals(Path.GetFullPath(oldBase), canonical, StringComparison.OrdinalIgnoreCase))
+        {
+            TxtBackupPath.Text = SettingsStore.Current.BaseBackupPath;
+            TxtSettingsBackupPath.Text = SettingsStore.Current.BaseBackupPath;
+            return;
+        }
+
+        // Перенос касается только профилей без персонального пути.
+        var movable = SettingsStore.Current.Drives
+            .Where(d => string.IsNullOrWhiteSpace(d.BaseBackupPathOverride))
+            .Select(d => (Profile: d,
+                          OldPath: Path.Combine(oldBase, d.FolderName),
+                          NewPath: Path.Combine(canonical, d.FolderName)))
+            .Where(x => Directory.Exists(x.OldPath))
+            .ToList();
+
+        bool migrate = false;
+        if (movable.Count > 0)
+        {
+            var dlg = new ContentDialog
+            {
+                Title = "Перенести существующие бэкапы?",
+                Content = $"В старой папке найдено копий: {movable.Count}. " +
+                          "Перенести их в новую папку? Если оставить, старые копии останутся на прежнем месте, " +
+                          "а приложение будет использовать новую папку (в таблице появится «Нет сохранения»).",
+                PrimaryButtonText = "Перенести",
+                SecondaryButtonText = "Оставить на месте",
+                CloseButtonText = "Отмена",
+                DefaultButton = ContentDialogButton.Primary,
+                XamlRoot = Content.XamlRoot,
+            };
+
+            var result = await dlg.ShowAsync();
+            if (result == ContentDialogResult.None) return;   // отмена — путь не меняем
+            migrate = result == ContentDialogResult.Primary;
+        }
+
+        SettingsStore.Current.BaseBackupPath = canonical;
+        SettingsStore.Save();
+        _backupPresence.Clear();
+        TxtBackupPath.Text = canonical;
+        TxtSettingsBackupPath.Text = canonical;
+        AppLog.Info("Глобальная папка хранения бэкапов изменена: " + canonical);
+
+        if (migrate)
+        {
+            TxtGlobalStatus.Text = "Перенос бэкапов…";
+            int moved = 0;
+            foreach (var item in movable)
+            {
+                // Каталог назначения уже существует? Не перетираем — оставляем как есть.
+                if (Directory.Exists(item.NewPath)) continue;
+
+                try
+                {
+                    TxtGlobalStatus.Text = $"Перенос «{item.Profile.Label}»…";
+                    await Task.Run(() => MoveDirectoryTree(item.OldPath, item.NewPath));
+                    moved++;
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error(ex, "Не удалось перенести бэкап: " + item.OldPath);
+                }
+            }
+
+            _backupPresence.Clear();
+            TxtGlobalStatus.Text = $"Перенесено копий: {moved}.";
+            AppLog.Info($"Перенос бэкапов завершён: {moved} из {movable.Count}");
+        }
+
+        RefreshList();
     }
 
     private void OnSyncAllClicked(object sender, RoutedEventArgs e)
@@ -583,23 +711,6 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    /// <summary>Удаление всех бэкапов (используется внешними сценариями, например деинсталлятором).</summary>
-    private void WipeAllBackups()
-    {
-        ShowWipeAll();
-        RefreshList();
-        try
-        {
-            _orchestrator.WipeEverything();
-        }
-        finally
-        {
-            _backupPresence.Clear();   // удалены все папки бэкапов
-            ShowIdle();
-            RefreshList();
-        }
-    }
-
     // ---------- Настройки-чекбоксы ----------
 
     private void OnMirrorChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.MirrorMode = true);
@@ -613,6 +724,18 @@ public sealed partial class MainWindow : Window
     private void OnSkipHiddenUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.SkipHiddenSystem = false);
     private void OnAutoTestChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.AutoTestNewDrives = true);
     private void OnAutoTestUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.AutoTestNewDrives = false);
+
+    private void OnIncludeUsbFixedChecked(object sender, RoutedEventArgs e)
+    {
+        SaveSetting(s => s.IncludeUsbFixedDrives = true);
+        EnumerateAlreadyPresentDrives();
+    }
+
+    private void OnIncludeUsbFixedUnchecked(object sender, RoutedEventArgs e)
+    {
+        SaveSetting(s => s.IncludeUsbFixedDrives = false);
+        EnumerateAlreadyPresentDrives();
+    }
 
     private void OnDefaultBufferChanged(object? sender, SelectionChangedEventArgs e)
     {
@@ -649,17 +772,12 @@ public sealed partial class MainWindow : Window
             var folder = await picker.PickSingleFolderAsync();
             if (folder is null) return;
 
-            SettingsStore.Current.BaseBackupPath = Path.GetFullPath(folder.Path);
-            SettingsStore.Save();
-            _backupPresence.Clear();   // у всех профилей сменился путь к бэкапу
-            TxtSettingsBackupPath.Text = SettingsStore.Current.BaseBackupPath;
-            TxtBackupPath.Text = SettingsStore.Current.BaseBackupPath;
-            RefreshList();
-            AppLog.Info("Глобальная папка хранения бэкапов изменена: " + SettingsStore.Current.BaseBackupPath);
+            await ChangeGlobalBackupPathAsync(folder.Path);
         }
         catch (Exception ex)
         {
             AppLog.Error(ex, "Не удалось выбрать папку хранения бэкапов");
+            await ShowInfoAsync("Ошибка", "Не удалось открыть диалог выбора папки:\n" + ex.Message);
         }
     }
     private void OnAutoUpdateChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.AutoCheckForUpdates = true);
@@ -944,7 +1062,11 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
                 WinRT.Interop.InitializeWithWindow.Initialize(picker, _hwnd);
                 var folder = await picker.PickSingleFolderAsync();
                 if (folder is null) return;
-                await RelocateDriveBackupAsync(profile, folder.Path, new Progress<SyncProgress>(p => OnProgress(p)));
+
+                var canonical = await ValidateChosenBaseAsync(folder.Path);
+                if (canonical is null) return;
+
+                await RelocateDriveBackupAsync(profile, canonical, new Progress<SyncProgress>(p => OnProgress(p)));
                 _backupPresence.Clear();   // бэкап перенесён: старый и новый путь изменились
                 backupPathText.Text = $"Папка хранения: {profile.BackupPath}";
                 statusText.Text = BuildDriveStatusText(profile);
@@ -996,9 +1118,13 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
             chkLive.IsChecked = SettingsStore.Current.LiveWatch;
             cmbBuffer.SelectedIndex = SettingsStore.Current.DefaultBufferSizeKb switch
             {
-                1024 => 0,
-                8192 => 2,
-                _ => 1,
+                512 => 1,
+                1024 => 2,
+                2048 => 3,
+                4096 => 4,
+                8192 => 5,
+                16384 => 6,
+                _ => 0, // «по стандарту»
             };
             chkFlush.IsChecked = SettingsStore.Current.DefaultFlushAfterFile;
             chkFastCopy.IsChecked = SettingsStore.Current.DefaultFastCopy;
@@ -1056,7 +1182,17 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
 
     private async Task RelocateDriveBackupAsync(DriveProfile profile, string newBase, IProgress<SyncProgress> progress)
     {
-        newBase = Path.GetFullPath(newBase);
+        // SEC: персональный путь проверяем и здесь — метод вызывается и по кнопке,
+        // и при сбросе к глобальной папке.
+        var canonicalBase = PathSafety.CanonicalizeBase(newBase);
+        if (canonicalBase is null)
+        {
+            AppLog.Error(null, "SEC B-03: перенос отменён — небезопасный путь: " + newBase);
+            TxtGlobalStatus.Text = "Нельзя использовать выбранную папку. Выберите другую.";
+            return;
+        }
+
+        newBase = canonicalBase;
         string oldPath = profile.BackupPath;
         string oldBase = string.IsNullOrWhiteSpace(profile.BaseBackupPathOverride) ? SettingsStore.Current.BaseBackupPath : profile.BaseBackupPathOverride!;
 
@@ -1263,10 +1399,11 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
 
             row.Enabled = profile.Enabled;
 
-            bool isConnected = false;
-            if (profile.DriveLetter != '\0')
-                isConnected = System.IO.Directory.Exists(profile.DriveLetter + ":\\");
-            row.RefreshState(isConnected ? "Включено" : "Выключено");
+            // Состояние строки: выключено / не подключена / резервирование / ошибка.
+            row.RefreshState(ComputeState(profile));
+
+            bool isConnected = profile.DriveLetter != '\0' &&
+                               System.IO.Directory.Exists(profile.DriveLetter + ":\\");
 
             // Directory.Exists(backupPath) — из того же кэша, что и hasBackup,
             // т.е. без дополнительного обращения к диску.
@@ -1396,12 +1533,6 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
         TxtGlobalStatus.Text = $"Удаление бэкапа [{drive}]...";
     }
 
-    private void ShowWipeAll()
-    {
-        GlobalProgressBar.IsIndeterminate = true;
-        TxtGlobalStatus.Text = "Удаление всех бэкапов...";
-    }
-
     private void ResetProgressIfIdle()
     {
         if (_orchestrator.ActiveSessions.Any(s => s.State == SessionState.Syncing))
@@ -1458,34 +1589,52 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
                 return;
             }
 
+            // Диалоги в скрытом окне невидимы: перед пользовательскими
+            // действиями показываем окно.
+            if (userInitiated && IsWindowHidden())
+                RestoreWindow();
+
             var now = DateTime.Now;
             var last = SettingsStore.Current.LastUpdateCheck;
             if (!userInitiated && (now - last).TotalHours < 24)
                 return;
-
-            SettingsStore.Current.LastUpdateCheck = now;
-            SettingsStore.Save();
 
             var info = await UpdateService.CheckAsync();
             var current = UpdateService.AppVersion;
 
             if (info is null)
             {
+                // Метку не двигаем: неудачная попытка не блокирует повтор на сутки.
                 if (userInitiated)
                     await ShowInfoAsync("Обновления", "Не удалось проверить обновления (нет сети?).");
                 return;
             }
 
-            if (info.Version < current)
+            // Проверка удалась — только теперь фиксируем время.
+            SettingsStore.Current.LastUpdateCheck = now;
+            SettingsStore.Save();
+
+            // Нормализованное сравнение: тег «4.3.1» и AssemblyVersion «4.3.1.0» равны.
+            int versionCmp = UpdateService.Compare(info.Version, current);
+            if (versionCmp < 0)
             {
                 if (userInitiated)
                     await ShowInfoAsync("Обновления", "У вас более новая версия, обновление не требуется.");
                 return;
             }
-            if (info.Version == current)
+            if (versionCmp == 0)
             {
                 if (userInitiated)
                     await ShowInfoAsync("Обновления", $"Установлена самая свежая версия ({current}).");
+                return;
+            }
+
+            // Фоновая проверка при скрытом окне: никаких модальных диалогов —
+            // только уведомление в трее.
+            if (IsWindowHidden())
+            {
+                SafeNotify("Smart USB Backup",
+                    $"Доступно обновление {info.Version} (сейчас {current}). Откройте окно, чтобы установить.");
                 return;
             }
 
@@ -1518,21 +1667,13 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
                 return;
             }
 
-            bool allowUnverified = false;
+            // SHA-256 обязателен: без хеша целостность не подтверждена.
             if (string.IsNullOrWhiteSpace(info.Sha256))
             {
-                var unverifiedDlg = new ContentDialog
-                {
-                    Title = "Обновление без проверки целостности",
-                    Content = "SHA-256 для этого обновления недоступен. Продолжить на свой риск?",
-                    PrimaryButtonText = "Продолжить",
-                    CloseButtonText = "Отменить",
-                    DefaultButton = ContentDialogButton.Close,
-                    XamlRoot = Content.XamlRoot,
-                };
-                if (await unverifiedDlg.ShowAsync() != ContentDialogResult.Primary)
-                    return;
-                allowUnverified = true;
+                await ShowInfoAsync("Обновления",
+                    "Для этого релиза не опубликован SHA-256, поэтому автоматическая установка недоступна. " +
+                    "Скачайте установщик со страницы релиза вручную.");
+                return;
             }
 
             var dlg = new ContentDialog
@@ -1548,23 +1689,54 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
             if (await dlg.ShowAsync() != ContentDialogResult.Primary)
                 return;
 
-            dlg.Title = "Загрузка обновления";
-            dlg.Content = "Подготовка…";
+            // Отдельный диалог прогресса: предыдущий уже закрыт ShowAsync(),
+            // поэтому менять его Title/Content было бессмысленно.
+            var progressBar = new ProgressBar { Minimum = 0, Maximum = 100, Value = 0, Width = 320 };
+            var progressText = new TextBlock { Text = $"0% из {info.Size / 1048576.0:F1} МБ" };
+            var progressPanel = new StackPanel { Spacing = 8 };
+            progressPanel.Children.Add(progressBar);
+            progressPanel.Children.Add(progressText);
+
+            using var downloadCts = new System.Threading.CancellationTokenSource();
+            var progressDlg = new ContentDialog
+            {
+                Title = "Загрузка обновления",
+                Content = progressPanel,
+                CloseButtonText = "Отмена",
+                DefaultButton = ContentDialogButton.Close,
+                XamlRoot = Content.XamlRoot,
+            };
+            // «Отмена» в диалоге отменяет и скачивание.
+            progressDlg.Closed += (_, _) => { try { downloadCts.Cancel(); } catch { } };
 
             var progress = new Progress<double>(v =>
-                dlg.Content = $"Загрузка: {v * 100:F0}% ({info.Size / 1048576.0:F1} МБ)");
+            {
+                double percent = Math.Clamp(v * 100, 0, 100);
+                progressBar.Value = percent;
+                progressText.Text = $"{percent:F0}% из {info.Size / 1048576.0:F1} МБ";
+            });
 
-            var path = await UpdateService.DownloadAsync(info, progress, allowUnverified: allowUnverified);
+            var showTask = progressDlg.ShowAsync().AsTask();
+            string? path;
+            try
+            {
+                path = await UpdateService.DownloadAsync(info, progress, downloadCts.Token);
+            }
+            finally
+            {
+                progressDlg.Hide();
+                try { await showTask; } catch { }
+            }
+
             if (path is null)
             {
-                await ShowInfoAsync("Обновления", "Произошла ошибка загрузки. Попробуйте позже.");
+                if (!downloadCts.IsCancellationRequested)
+                    await ShowInfoAsync("Обновления", "Произошла ошибка загрузки. Попробуйте позже.");
                 return;
             }
 
-            dlg.Title = "Установка";
-            dlg.Content = "Запуск инсталлятора…";
-            await Task.Delay(400);
-            if (UpdateService.ApplyUpdate(path))
+            // Перезапускаем так же, как приложение работало: скрыто — если было скрыто.
+            if (UpdateService.ApplyUpdate(path, restartHidden: IsWindowHidden()))
             {
                 await PerformShutdownForUpdate();
             }

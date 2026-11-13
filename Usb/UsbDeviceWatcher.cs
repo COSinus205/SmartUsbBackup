@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using SmartUsbBackup.Core;
 using static SmartUsbBackup.NativeMethods;
 
 namespace SmartUsbBackup.Usb;
@@ -295,7 +296,8 @@ public sealed class UsbDeviceWatcher
         {
             try
             {
-                var info = QueryDrive(letter, retry: 3, delayMs: 200);
+                var info = QueryDrive(letter, retry: 3, delayMs: 200,
+                    includeFixed: SettingsStore.Current.IncludeUsbFixedDrives);
                 if (info is not null)
                 {
                     AppLog.Info($"WM_DEVICECHANGE: ARRIVAL {letter}: «{info!.Value.VolumeLabel}» serial={info.Value.Serial}");
@@ -317,12 +319,76 @@ public sealed class UsbDeviceWatcher
     public void RaiseArrived(char letter, string volumeLabel, string serial)
         => DriveArrived?.Invoke(new UsbDriveEventArgs(letter, volumeLabel, serial));
 
-    public static (string VolumeLabel, string Serial)? QueryDrive(char letter, int retry, int delayMs)
+    /// <summary>
+    /// Подходит ли том для резервирования:
+    ///   • DRIVE_REMOVABLE — всегда (обычные флешки);
+    ///   • DRIVE_FIXED — только при includeFixed и если шина USB
+    ///     (внешние HDD/SSD в USB-корпусе Windows видит как фиксированные).
+    /// </summary>
+    public static bool IsEligibleDrive(char letter, bool includeFixed)
+    {
+        var root = $@"{letter}:\";
+        uint type = GetDriveTypeW(root);
+        if (type == 2) return true;                 // DRIVE_REMOVABLE
+        if (type == 3 && includeFixed) return IsUsbBus(letter); // DRIVE_FIXED
+        return false;
+    }
+
+    private const uint IoctlStorageQueryProperty = 0x002D1400;
+    private const int StorageDeviceProperty = 0;
+    private const int BusTypeUsb = 0x07;
+
+    /// <summary>Определяет USB по типу шины накопителя (IOCTL_STORAGE_QUERY_PROPERTY).</summary>
+    public static bool IsUsbBus(char letter)
+    {
+        IntPtr handle = IntPtr.Zero;
+        IntPtr inBuf = IntPtr.Zero;
+        IntPtr outBuf = IntPtr.Zero;
+        try
+        {
+            handle = CreateFileW(@"\\.\" + letter + ":", 0, FILE_SHARE_READ_WRITE,
+                IntPtr.Zero, OPEN_EXISTING_U32, 0, IntPtr.Zero);
+            if (handle == IntPtr.Zero || handle == new IntPtr(unchecked((int)INVALID_HANDLE_VALUE_U32)))
+                return false;
+
+            // STORAGE_PROPERTY_QUERY: PropertyId (StorageDeviceProperty) + QueryType (Standard).
+            const int querySize = 12;
+            const int outSize = 1024; // с запасом: STORAGE_DEVICE_DESCRIPTOR + RawDeviceProperties
+            inBuf = Marshal.AllocHGlobal(querySize);
+            outBuf = Marshal.AllocHGlobal(outSize);
+            for (int i = 0; i < querySize; i++) Marshal.WriteByte(inBuf, i, 0);
+
+            if (!DeviceIoControl(handle, IoctlStorageQueryProperty,
+                    inBuf, querySize, outBuf, outSize, out _, IntPtr.Zero))
+            {
+                return false;
+            }
+
+            // BusType лежит по смещению 28 в STORAGE_DEVICE_DESCRIPTOR.
+            int busType = Marshal.ReadInt32(outBuf, 28);
+            return busType == BusTypeUsb;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warn($"Не удалось определить тип шины диска {letter}: {ex.Message}");
+            return false;
+        }
+        finally
+        {
+            if (inBuf != IntPtr.Zero) Marshal.FreeHGlobal(inBuf);
+            if (outBuf != IntPtr.Zero) Marshal.FreeHGlobal(outBuf);
+            if (handle != IntPtr.Zero && handle != new IntPtr(unchecked((int)INVALID_HANDLE_VALUE_U32)))
+                try { CloseHandle(handle); } catch { }
+        }
+    }
+
+    public static (string VolumeLabel, string Serial)? QueryDrive(
+        char letter, int retry, int delayMs, bool includeFixed = false)
     {
         var root = $@"{letter}:\";
         for (int attempt = 0; attempt < retry; attempt++)
         {
-            if (GetDriveTypeW(root) == 2)
+            if (IsEligibleDrive(letter, includeFixed))
             {
                 var label = new StringBuilder(261);
                 var fs = new StringBuilder(64);

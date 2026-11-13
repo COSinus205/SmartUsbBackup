@@ -91,6 +91,36 @@ internal static class NativeMethods
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern uint GetDriveTypeW(string rootPathName);
 
+    // ---------- Тип шины накопителя (USB HDD/SSD определяются как DRIVE_FIXED) ----------
+
+    public const uint INVALID_HANDLE_VALUE_U32 = 0xFFFFFFFF;
+    public const uint FILE_SHARE_READ_WRITE = 0x00000003;
+    public const uint OPEN_EXISTING_U32 = 3;
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateFileW(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool DeviceIoControl(
+        IntPtr hDevice,
+        uint dwIoControlCode,
+        IntPtr lpInBuffer,
+        uint nInBufferSize,
+        IntPtr lpOutBuffer,
+        uint nOutBufferSize,
+        out uint lpBytesReturned,
+        IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
     // ---------- Автозагрузка (HKCU\...\Run) ----------
 
     public const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";

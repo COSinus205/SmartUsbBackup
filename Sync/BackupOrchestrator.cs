@@ -82,7 +82,38 @@ public sealed class BackupOrchestrator : IDisposable
             WireFileWatcher(session);
         }
 
-        _sessions[$"{e.DriveLetter}"] = session;
+        var key = e.DriveLetter.ToString();
+
+        // Заменяем возможную старую сессию для этой же буквы: иначе её watcher,
+        // polling-таймер и CTS продолжают жить и писать в тот же бэкап.
+        if (_sessions.TryGetValue(key, out var previous))
+        {
+            AppLog.Warn($"Подключение {key}: заменяю незакрытую сессию прошлого подключения");
+            StopPolling(previous, out _, out _);
+            if (_fullSyncs.TryRemove(key, out var previousCts))
+            {
+                try { previousCts.Cancel(); } catch { /* задача освободит CTS сама */ }
+            }
+            _syncTasks.TryRemove(key, out _);
+            try { previous.Dispose(); } catch { }
+        }
+
+        _sessions[key] = session;
+
+        // Бэкап на самой флешке (или внутри её корня) недопустим: иначе файлы
+        // следующего прогона начнут копироваться внутрь уже созданной копии.
+        bool backupOnSource = false;
+        try
+        {
+            var backupFull = Path.GetFullPath(profile.BackupPath);
+            backupOnSource = PathSafety.IsSameVolume(backupFull, session.SourceRoot) ||
+                             PathSafety.IsInsideOrEqual(session.SourceRoot, backupFull);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, "Не удалось проверить путь бэкапа");
+            backupOnSource = true;
+        }
 
         if (!SettingsStore.Current.ForceLegacyWatcher && SettingsStore.Current.UsePollingInIdle)
         {
@@ -98,8 +129,15 @@ public sealed class BackupOrchestrator : IDisposable
         // UI: флешка подключается, метаданные ещё читаются.
         ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Connecting) { DriveName = driveNameArrived });
 
+        if (backupOnSource)
+        {
+            session.State = SessionState.Error;
+            session.LastResult = "папка бэкапа находится на этой же флешке — выберите другую папку хранения";
+            AppLog.Error(null, $"Синхронизация {key} отменена: папка бэкапа на источнике: {profile.BackupPath}");
+            StateChanged?.Invoke();
+        }
         // Полная зеркальная синхронизация при подключении (только если профиль включён).
-        if (profile.Enabled) StartFullSync(session);
+        else if (profile.Enabled) StartFullSync(session);
         else AppLog.Info($"Флешка «{profile.Label}» подключена, но её резервирование выключено");
 
         // Авто-тест НЕ задерживает подключение: чтение до 16 МБ с флешки занимает
@@ -491,11 +529,16 @@ public sealed class BackupOrchestrator : IDisposable
         // Отменяем активную копию (CancellationTokenSource), если она была.
         if (_fullSyncs.TryRemove(key, out var cts))
         {
-            cts.Cancel();
-            cts.Dispose();
+            try { cts.Cancel(); } catch { }
+            // Dispose сделает задача синхронизации в своём finally.
         }
         _syncTasks.TryRemove(key, out _);
         _detachingDrives.TryRemove(key, out _);
+
+        // Буква больше не принадлежит этой флешке: иначе после переиспользования
+        // буквы другим диском строка показывала бы «Включено» и цепляла чужой том.
+        session.Profile.DriveLetter = '\0';
+
         StopPolling(session, out _, out _);
         string driveNameRemoved = string.IsNullOrWhiteSpace(session.Profile.Label) ? "USB" : (string.IsNullOrWhiteSpace(session.Profile.Serial) ? session.Profile.Label : $"{session.Profile.Label} [{session.Profile.Serial}]");
         ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Idle) { DriveName = driveNameRemoved });
@@ -549,13 +592,20 @@ public sealed class BackupOrchestrator : IDisposable
 
         int syncMs = 0;
         bool syncTimedOut = false;
-        if (_syncTasks.TryGetValue(key, out var running))
+        // Полная синхронизация И активные live-копии: безопасное извлечение
+        // не должно возвращать «можно извлекать», пока файл ещё пишется.
+        bool hasFullSync = _syncTasks.TryGetValue(key, out var running);
+        var waits = new List<Task>();
+        if (hasFullSync && running is not null) waits.Add(running);
+        waits.AddRange(session.LiveCopies.Keys);
+
+        if (waits.Count > 0)
         {
             var syncSw = Stopwatch.StartNew();
-            try { Task.WhenAny(running, Task.Delay(1000)).Wait(); }
+            try { Task.WhenAny(Task.WhenAll(waits), Task.Delay(1000)).Wait(); }
             catch (Exception ex) { AppLog.Error(ex, $"[SAFE-REMOVE] {letter}: ожидание sync завершилось ошибкой"); }
             syncMs = (int)syncSw.ElapsedMilliseconds;
-            syncTimedOut = !running.IsCompleted;
+            syncTimedOut = waits.Any(t => !t.IsCompleted);
         }
 
         int totalMs = (int)wholeSw.ElapsedMilliseconds;
@@ -565,6 +615,7 @@ public sealed class BackupOrchestrator : IDisposable
             // финальная проверка: никаких незакрытых хэндлов/задач
             (session.PollingTask == null || session.PollingTask.IsCompleted) &&
             session.FileWatcher == null &&
+            session.LiveCopies.IsEmpty &&
             (!_syncTasks.ContainsKey(key) || _syncTasks[key].IsCompleted);
 
         AppLog.Info(
@@ -626,8 +677,8 @@ public sealed class BackupOrchestrator : IDisposable
                 AppLog.Warn($"Полная синхронизация {key}: снята устаревшая запись (сессия сменилась)");
                 try { existingCts.Cancel(); }
                 catch { /* мог уже быть disposed */ }
-                try { existingCts.Dispose(); }
-                catch { }
+                // Dispose делает владеющая задача в своём finally: здесь токен
+                // ещё может использоваться читающим потоком.
                 _fullSyncs.TryRemove(key, out _);
             }
 
@@ -635,6 +686,8 @@ public sealed class BackupOrchestrator : IDisposable
             session.CurrentCts = cts;
             _fullSyncs[key] = cts;
         }
+
+        var sessionCts = session.CurrentCts!;
 
         session.State = SessionState.Syncing;
         session.PendingChanges = false;
@@ -657,9 +710,8 @@ public sealed class BackupOrchestrator : IDisposable
                     session.FileWatcher = new UsbFileWatcher(session.SourceRoot);
 
                 EnsureWatcher(session);
-                var cts = session.CurrentCts!;
                 var result = await session.FsSync.SyncAllAsync(
-                    session.SourceRoot, session.BackupPath, progress, cts.Token);
+                    session.SourceRoot, session.BackupPath, progress, sessionCts.Token);
 
                 session.State = result.Error is null ? SessionState.Idle : SessionState.Error;
                 session.LastResult = result.Error ?? $"копий {result.Copied}, удалено {result.Deleted}, пропущено {result.Skipped}";
@@ -668,7 +720,8 @@ public sealed class BackupOrchestrator : IDisposable
                 SyncFinished?.Invoke(session, result);
 
                 // После успешного завершения переходим в режим ожидания изменений, если он включён.
-                if (result.Error is null && SettingsStore.Current.LiveWatch)
+                bool effectiveLiveWatch = session.Profile.LiveWatchOverride ?? SettingsStore.Current.LiveWatch;
+                if (result.Error is null && effectiveLiveWatch)
                 {
                     ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.LiveWatch) { DriveName = driveNameSync });
                 }
@@ -691,9 +744,12 @@ public sealed class BackupOrchestrator : IDisposable
             {
                 lock (_fullSyncs)
                 {
-                    if (_fullSyncs.TryGetValue(key, out var c) && c == session.CurrentCts)
+                    if (_fullSyncs.TryGetValue(key, out var c) && c == sessionCts)
                         _fullSyncs.TryRemove(key, out _);
                 }
+                if (ReferenceEquals(session.CurrentCts, sessionCts))
+                    session.CurrentCts = null;
+                try { sessionCts.Dispose(); } catch { }
                 if (!SettingsStore.Current.ForceLegacyWatcher)
                     CloseWatcher(session);
                 _syncTasks.TryRemove(key, out _);
@@ -752,8 +808,20 @@ public sealed class BackupOrchestrator : IDisposable
             if (!session.Profile.Enabled) return;
             // Мгновенная синхронизация опциональна (по умолчанию выключена): без неё
             // файлы синхронизируются только при подключении флешки или по кнопке.
-            if (!SettingsStore.Current.LiveWatch) return;
-            await session.FsSync.SyncSingleFileAsync(fullPath, session.SourceRoot, session.BackupPath);
+            bool effectiveLiveWatch = session.Profile.LiveWatchOverride ?? SettingsStore.Current.LiveWatch;
+            if (!effectiveLiveWatch) return;
+
+            var copyTask = session.FsSync.SyncSingleFileAsync(
+                fullPath, session.SourceRoot, session.BackupPath, session.DetachCts.Token);
+            session.LiveCopies.TryAdd(copyTask, 0);
+            try
+            {
+                await copyTask.ConfigureAwait(false);
+            }
+            finally
+            {
+                session.LiveCopies.TryRemove(copyTask, out _);
+            }
         }
         catch (Exception ex)
         {
@@ -766,7 +834,7 @@ public sealed class BackupOrchestrator : IDisposable
         try
         {
             if (!session.Profile.Enabled) return;
-            if (!SettingsStore.Current.LiveWatch) return;
+            if (!(session.Profile.LiveWatchOverride ?? SettingsStore.Current.LiveWatch)) return;
             session.FsSync.DeleteFromBackup(fullPath, session.SourceRoot, session.BackupPath);
         }
         catch (Exception ex)
@@ -781,7 +849,8 @@ public sealed class BackupOrchestrator : IDisposable
 
     /// <summary>
     /// Полная очистка: остановка всех задач, выгрузка watcher'ов, удаление всех папок бэкапов и настроек.
-    /// Используется кнопкой «Удалить всё» в UI и деинсталлятором (Inno Setup вызывает с флагами).
+    /// Публичный API для внешних сценариев (например, обслуживания/деинсталляции);
+    /// вызывать не из UI-потока — операция блокирующая.
     /// </summary>
     public void WipeEverything()
     {
@@ -798,27 +867,54 @@ public sealed class BackupOrchestrator : IDisposable
             return;
         }
 
+        // Персональные папки профилей — до очистки списка Drives.
+        var profileBackups = new List<string>();
+        foreach (var profile in SettingsStore.Current.Drives)
+        {
+            var effectiveBase = EffectiveBase(profile);
+            if (effectiveBase is null ||
+                string.Equals(effectiveBase, canonicalBase, StringComparison.OrdinalIgnoreCase))
+            {
+                continue; // глобальная база удаляется целиком ниже
+            }
+
+            string backupPath;
+            try { backupPath = Path.GetFullPath(Path.Combine(effectiveBase, profile.FolderName)); }
+            catch { continue; }
+
+            if (PathSafety.IsInsideDirectory(effectiveBase, backupPath) &&
+                !PathSafety.ContainsReparsePoint(backupPath))
+            {
+                profileBackups.Add(backupPath);
+            }
+        }
+
         foreach (var letter in _sessions.Keys)
         {
-            if (_fullSyncs.TryRemove(letter, out var cts)) { cts.Cancel(); cts.Dispose(); }
+            if (_fullSyncs.TryRemove(letter, out var cts))
+            {
+                // Только Cancel: Dispose — забота владеющей задачи.
+                try { cts.Cancel(); } catch { }
+            }
         }
         foreach (var session in _sessions.Values) session.Dispose();
         _sessions.Clear();
 
         try
         {
+            foreach (var backupPath in profileBackups.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (Directory.Exists(backupPath))
+                {
+                    DeleteTreeContents(backupPath);
+                    try { Directory.Delete(backupPath, recursive: false); }
+                    catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить папку бэкапа: " + backupPath); }
+                }
+            }
+
             if (Directory.Exists(canonicalBase))
             {
-                foreach (var file in Directory.EnumerateFiles(canonicalBase, "*", SearchOption.AllDirectories))
-                {
-                    try { System.IO.File.Delete(file); }
-                    catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить файл: " + file); }
-                }
-                foreach (var dir in Directory.EnumerateDirectories(canonicalBase, "*", SearchOption.AllDirectories).OrderByDescending(d => d.Length))
-                {
-                    try { Directory.Delete(dir, recursive: false); }
-                    catch { /* папка занята или недоступна */ }
-                }
+                DeleteTreeContents(canonicalBase);
                 try { Directory.Delete(canonicalBase, recursive: false); }
                 catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить корневую папку бэкапов"); }
             }
@@ -827,6 +923,65 @@ public sealed class BackupOrchestrator : IDisposable
             AppLog.Info("Все бэкапы и настройки удалены");
         }
         catch (Exception ex) { AppLog.Error(ex, "Не удалось полностью очистить бэкапы"); }
+    }
+
+    /// <summary>
+    /// Безопасная база профиля: проверенный персональный путь или глобальная база.
+    /// </summary>
+    private static string? EffectiveBase(DriveProfile profile)
+    {
+        if (!string.IsNullOrWhiteSpace(profile.BaseBackupPathOverride))
+        {
+            var canonical = PathSafety.CanonicalizeBase(profile.BaseBackupPathOverride);
+            if (canonical is not null) return canonical;
+        }
+        return PathSafety.CanonicalizeBase(SettingsStore.Current.BaseBackupPath);
+    }
+
+    /// <summary>
+    /// Удаляет содержимое каталога, НЕ проходя сквозь junction/symlink:
+    /// сама ссылка удаляется, её цель не затрагивается.
+    /// </summary>
+    private static void DeleteTreeContents(string root)
+    {
+        var opts = new EnumerationOptions
+        {
+            RecurseSubdirectories = false,
+            IgnoreInaccessible = true,
+            AttributesToSkip = 0,
+        };
+
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(root, "*", opts))
+            {
+                try { System.IO.File.Delete(file); }
+                catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить файл: " + file); }
+            }
+        }
+        catch (Exception ex) { AppLog.Error(ex, "Не удалось перечислить файлы: " + root); }
+
+        try
+        {
+            foreach (var dir in Directory.EnumerateDirectories(root, "*", opts))
+            {
+                try
+                {
+                    var attrs = System.IO.File.GetAttributes(dir);
+                    if ((attrs & FileAttributes.ReparsePoint) != 0)
+                    {
+                        // Удаляем только саму точку повторной обработки.
+                        try { Directory.Delete(dir, recursive: false); } catch { }
+                        continue;
+                    }
+
+                    DeleteTreeContents(dir);
+                    try { Directory.Delete(dir, recursive: false); } catch { /* занято */ }
+                }
+                catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить каталог: " + dir); }
+            }
+        }
+        catch (Exception ex) { AppLog.Error(ex, "Не удалось перечислить каталоги: " + root); }
     }
 
 
@@ -841,11 +996,11 @@ public sealed class BackupOrchestrator : IDisposable
     /// </summary>
     public async Task WipeOneAsync(DriveProfile profile, IProgress<SyncProgress>? progress = null)
     {
-        // SEC: B-02/D-01 — каноническая проверка базы и принадлежности BackupPath.
-        var canonicalBase = PathSafety.CanonicalizeBase(SettingsStore.Current.BaseBackupPath);
-        if (canonicalBase is null)
+        // SEC: B-02/D-01 — персональная база профиля тоже должна быть безопасной.
+        var effectiveBase = EffectiveBase(profile);
+        if (effectiveBase is null)
         {
-            AppLog.Error(null, "SEC B-02: WipeOneAsync отменён — небезопасный базовый путь");
+            AppLog.Error(null, "SEC B-02: WipeOneAsync отменён — небезопасный базовый путь профиля");
             return;
         }
 
@@ -864,7 +1019,7 @@ public sealed class BackupOrchestrator : IDisposable
         try { fullBackupPath = Path.GetFullPath(profile.BackupPath); }
         catch (Exception ex) { AppLog.Error(ex, "SEC B-02: некорректный путь бэкапа"); return; }
 
-        if (!PathSafety.IsSafeSubPath(canonicalBase, fullBackupPath))
+        if (!PathSafety.IsSafeSubPath(effectiveBase, fullBackupPath))
         {
             AppLog.Error(null, "SEC B-02: BackupPath вне базовой папки: " + fullBackupPath);
             return;
@@ -920,11 +1075,18 @@ public sealed class BackupOrchestrator : IDisposable
             {
                 List<string> files = new();
                 int totalFiles = 0;
-                if (Directory.Exists(profile.BackupPath))
+                if (Directory.Exists(fullBackupPath))
                 {
                     try
                     {
-                        files = Directory.EnumerateFiles(profile.BackupPath, "*", SearchOption.AllDirectories).ToList();
+                        // Не проходим сквозь junction/symlink внутри бэкапа.
+                        var opts = new EnumerationOptions
+                        {
+                            RecurseSubdirectories = true,
+                            IgnoreInaccessible = true,
+                            AttributesToSkip = FileAttributes.ReparsePoint,
+                        };
+                        files = Directory.EnumerateFiles(fullBackupPath, "*", opts).ToList();
                         totalFiles = files.Count;
                     }
                     catch (Exception ex) { AppLog.Error(ex, "Не удалось перечислить файлы бэкапа"); }
@@ -934,7 +1096,7 @@ public sealed class BackupOrchestrator : IDisposable
                 var wipeSw = Stopwatch.StartNew();
                 progress?.Report(new SyncProgress(driveLetter, 0, totalFiles, 0, 0, 0, totalFiles, "", SyncPhase.Wipe) { DriveName = driveNameWipe });
 
-                if (Directory.Exists(profile.BackupPath) && files.Count > 0)
+                if (Directory.Exists(fullBackupPath) && files.Count > 0)
                 {
                     foreach (var file in files)
                     {
@@ -958,15 +1120,13 @@ public sealed class BackupOrchestrator : IDisposable
                     // Финальный отчёт после цикла (если последний батч не совпал с % 128).
                     if (progress is not null && done > 0 && done != totalFiles)
                         progress.Report(new SyncProgress(driveLetter, done, totalFiles, 0, 0, done, totalFiles, "", SyncPhase.Wipe) { DriveName = driveNameWipe });
+                }
 
-                    var dirs = Directory.EnumerateDirectories(profile.BackupPath, "*", SearchOption.AllDirectories)
-                        .OrderByDescending(d => d.Length).ToList();
-                    foreach (var dir in dirs)
-                    {
-                        try { Directory.Delete(dir, recursive: false); }
-                        catch { /* папка занята или недоступна */ }
-                    }
-                    try { Directory.Delete(profile.BackupPath, recursive: false); }
+                if (Directory.Exists(fullBackupPath))
+                {
+                    // Каталоги и reparse-точки: внутрь ссылок не заходим.
+                    DeleteTreeContents(fullBackupPath);
+                    try { Directory.Delete(fullBackupPath, recursive: false); }
                     catch (Exception ex) { AppLog.Error(ex, "Не удалось удалить папку бэкапа"); }
                 }
 
@@ -1092,6 +1252,8 @@ public sealed class ConnectedSession : IDisposable
     internal System.Threading.Tasks.Task<string>? PollingTask { get; set; }
     internal System.Threading.Timer? PollingTimer { get; set; }
     public volatile bool DetachRequested;
+    /// <summary>Идущие live-копии: safe-remove должен их дождаться/отменить.</summary>
+    internal readonly ConcurrentDictionary<Task, byte> LiveCopies = new();
     public System.DateTime LastSuccessfulSyncUtc { get; set; } = System.DateTime.MinValue;
     /// <summary>Корень флешки, например "D:\".</summary>
     public string SourceRoot => $@"{Letter}:\";
@@ -1160,9 +1322,11 @@ public sealed class ConnectedSession : IDisposable
                 return;
             }
 
-            try { CurrentCts?.Dispose(); } catch { }
+            try { CurrentCts?.Cancel(); } catch { }
             CurrentCts = null;
-            try { DetachCts.Dispose(); } catch { }
+            try { DetachCts.Cancel(); } catch { }
+            // Старый CTS не освобождаем: его токен могли использовать live-копии.
+            // Он будет собран GC после завершения всех подписчиков.
             DetachCts = new CancellationTokenSource();
             FileWatcher = null;
             AttachmentState = DriveAttachmentState.Attached;
@@ -1176,12 +1340,16 @@ public sealed class ConnectedSession : IDisposable
             if (_disposed) return;
             _disposed = true;
 
+            try { PollingTimer?.Dispose(); } catch { }
+            PollingTimer = null;
+
             try { FileWatcher?.Dispose(); } catch { }
             FileWatcher = null;
 
             try { CurrentCts?.Cancel(); } catch { }
         try { DetachCts.Cancel(); } catch { }
-            try { CurrentCts?.Dispose(); } catch { }
+            // Не Dispose: задача синхронизации могла ещё использовать токен.
+            // Владелец CTS освобождает его сам (StartFullSync/GC).
             CurrentCts = null;
 
             AttachmentState = DriveAttachmentState.Removed;

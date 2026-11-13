@@ -23,7 +23,7 @@ namespace SmartUsbBackup.Usb;
 public sealed class UsbFileWatcher : IDisposable
 {
     /// <summary>Задержка «поджатия» быстрых повторных событий одного файла.</summary>
-    public TimeSpan DebounceMs { get; set; } = TimeSpan.FromMilliseconds(800);
+    public TimeSpan DebounceMs { get; set; } = TimeSpan.FromMilliseconds(1200);
 
     public event Action<string>? FileChanged;   // относительный или полный путь — полный
     public event Action<string>? FileDeleted;
@@ -64,10 +64,10 @@ public sealed class UsbFileWatcher : IDisposable
             catch (Exception ex) { AppLog.Error(ex, "[WATCH] Ошибка обработчика OverflowDetected"); }
         };
 
-        // ОДИН таймер на всё окно наблюдения: каждые 1.2 с проверяем очередь.
-        // Таймер НЕ крутит сканирование диска — он лишь отжимает копию из очереди (список путей),
-        // и если очередь пуста — мгновенно выходит. Ночник CPU: микросекунды.
-        _drainTimer = new System.Threading.Timer(_ => DrainAsync().GetAwaiter().GetResult(), null, 1200, 1200);
+        // ОДИН таймер на всё окно наблюдения: периодичность берётся из DebounceMs
+        // (единая точка настройки «поджатия» событий), а не из захардкоженного числа.
+        var period = DebounceMs > TimeSpan.Zero ? DebounceMs : TimeSpan.FromMilliseconds(1200);
+        _drainTimer = new System.Threading.Timer(_ => DrainAsync().GetAwaiter().GetResult(), null, period, period);
     }
 
     private void QueueChange(string fullPath) => _pending.TryAdd(fullPath, 0);

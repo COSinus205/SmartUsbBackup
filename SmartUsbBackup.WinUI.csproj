@@ -54,10 +54,10 @@
 
     <AssemblyName>SmartUsbBackup</AssemblyName>
     <RootNamespace>SmartUsbBackup</RootNamespace>
-    <Version>4.3.1</Version>
-    <FileVersion>4.3.1.0</FileVersion>
-    <AssemblyVersion>4.3.1.0</AssemblyVersion>
-    <InformationalVersion>4.3.1</InformationalVersion>
+    <Version>4.3.2</Version>
+    <FileVersion>4.3.2.0</FileVersion>
+    <AssemblyVersion>4.3.2.0</AssemblyVersion>
+    <InformationalVersion>4.3.2</InformationalVersion>
     <Company>Smart USB Backup</Company>
     <Product>Smart USB Backup</Product>
     <Description>Зеркальное резервное копирование USB-флешек (WinUI 3, событийная модель)</Description>

@@ -41,11 +41,27 @@ public sealed class DriveProfile
     [JsonPropertyName("firstSeen")]
     public DateTime FirstSeen { get; set; } = DateTime.Now;
 
-    /// <summary>Полный путь к папке бэкапа (внутри базовой папки).</summary>
+    /// <summary>
+    /// Полный путь к папке бэкапа (внутри базовой папки).
+    /// Персональный путь перепроверяется на безопасность при каждом обращении:
+    /// если он некорректен (например, settings.json отредактирован вручную),
+    /// используется глобальная база, а не произвольный путь.
+    /// </summary>
     [JsonIgnore]
-    public string BackupPath => Path.Combine(
-        string.IsNullOrWhiteSpace(BaseBackupPathOverride) ? SettingsStore.Current.BaseBackupPath : BaseBackupPathOverride!,
-        FolderName);
+    public string BackupPath
+    {
+        get
+        {
+            if (!string.IsNullOrWhiteSpace(BaseBackupPathOverride))
+            {
+                var safeOverride = PathSafety.CanonicalizeBase(BaseBackupPathOverride);
+                if (safeOverride is not null)
+                    return Path.Combine(safeOverride, FolderName);
+            }
+
+            return Path.Combine(SettingsStore.Current.BaseBackupPath, FolderName);
+        }
+    }
 
     [JsonPropertyName("settingsTested")]
     public bool SettingsTested { get; set; }
@@ -162,6 +178,14 @@ public sealed class AppSettings
     [JsonPropertyName("forceLegacyWatcher")]
     public bool ForceLegacyWatcher { get; set; } = false;
 
+    /// <summary>
+    /// Учитывать USB-диски, которые Windows определяет как DRIVE_FIXED
+    /// (внешние HDD/SSD в USB-корпусе). По умолчанию выключено: обрабатываются
+    /// только съёмные носители.
+    /// </summary>
+    [JsonPropertyName("includeUsbFixedDrives")]
+    public bool IncludeUsbFixedDrives { get; set; } = false;
+
     /// <summary>Список известных флешек.</summary>
     [JsonPropertyName("drives")]
     public List<DriveProfile> Drives { get; set; } = new();
@@ -198,6 +222,10 @@ public static class SettingsStore
     internal const string RegKey = @"Software\SmartUsbBackup";
     internal const string RegBasePathValue = "BaseBackupPath";
 
+    /// <summary>Список всех баз хранения (глобальная + персональные) — читается деинсталлятором.</summary>
+    internal const string RegBackupRootCountValue = "BackupRootCount";
+    internal const string RegBackupRootValuePrefix = "BackupRoot";
+
     internal static readonly JsonSerializerOptions JsonOpts = new()
     {
         WriteIndented = true,
@@ -229,11 +257,28 @@ public static class SettingsStore
                         s.BaseBackupPath = canonicalBase;
                     }
 
-                    // Нормализуем Profile.FolderName для старых записей without folder name.
+                    // Нормализуем Profile.FolderName и персональные пути хранения.
                     foreach (var d in s.Drives ?? new List<DriveProfile>())
                     {
-                        if (string.IsNullOrWhiteSpace(d.FolderName))
+                        if (IsUnsafeFolderName(d.FolderName))
+                        {
+                            AppLog.Warn("Небезопасное имя папки профиля — перегенерировано: " + d.FolderName);
                             d.FolderName = BuildFolderName(d.Label, d.Serial);
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(d.BaseBackupPathOverride))
+                        {
+                            var canonicalOverride = PathSafety.CanonicalizeBase(d.BaseBackupPathOverride);
+                            if (canonicalOverride is null)
+                            {
+                                AppLog.Warn("Небезопасный персональный путь хранения — сброшен: " + d.BaseBackupPathOverride);
+                                d.BaseBackupPathOverride = null;
+                            }
+                            else
+                            {
+                                d.BaseBackupPathOverride = canonicalOverride;
+                            }
+                        }
                     }
 
                     return s;
@@ -259,8 +304,8 @@ public static class SettingsStore
                 Directory.CreateDirectory(Dir);
                 var tmp = FilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 File.WriteAllText(tmp, JsonSerializer.Serialize(Current, JsonOpts));
-                if (File.Exists(FilePath)) File.Delete(FilePath);
-                File.Move(tmp, FilePath);
+                // Атомарная замена: при сбое посреди записи старый файл остаётся целым.
+                File.Move(tmp, FilePath, overwrite: true);
             }
             catch (Exception ex)
             {
@@ -270,8 +315,35 @@ public static class SettingsStore
             try
             {
                 using var key = Registry.CurrentUser.CreateSubKey(RegKey, writable: true);
-                if (!string.IsNullOrEmpty(Current.BaseBackupPath))
-                    key?.SetValue(RegBasePathValue, Current.BaseBackupPath);
+                if (key is not null && !string.IsNullOrEmpty(Current.BaseBackupPath))
+                    key.SetValue(RegBasePathValue, Current.BaseBackupPath);
+
+                // Деинсталлятору нужен список ВСЕХ баз: иначе персональные папки
+                // профилей (BaseBackupPathOverride) остаются вне его поля зрения.
+                var roots = new List<string>();
+                void AddRoot(string? path)
+                {
+                    var canonical = PathSafety.CanonicalizeBase(path);
+                    if (canonical is null) return;
+                    if (!roots.Exists(r => string.Equals(r, canonical, StringComparison.OrdinalIgnoreCase)))
+                        roots.Add(canonical);
+                }
+                AddRoot(Current.BaseBackupPath);
+                foreach (var d in Current.Drives) AddRoot(d.BaseBackupPathOverride);
+
+                if (key is not null)
+                {
+                    key.SetValue(RegBackupRootCountValue, roots.Count, RegistryValueKind.DWord);
+                    for (int i = 0; i < roots.Count; i++)
+                        key.SetValue(RegBackupRootValuePrefix + i, roots[i]);
+
+                    // Подчищаем значения, оставшиеся от прошлых сохранений.
+                    for (int i = roots.Count; i < roots.Count + 16; i++)
+                    {
+                        try { key.DeleteValue(RegBackupRootValuePrefix + i, throwOnMissingValue: false); }
+                        catch { /* не критично */ }
+                    }
+                }
             }
             catch { /* реестр не критичен */ }
         }
@@ -316,11 +388,7 @@ public static class SettingsStore
             }
 
             // SEC: C-02 — перегенерация небезопасного FolderName (fail-safe).
-            if (PathSafety.IsReservedWindowsName(found.FolderName) ||
-                found.FolderName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
-                found.FolderName.Contains("..", StringComparison.Ordinal) ||
-                found.FolderName.Contains(Path.DirectorySeparatorChar) ||
-                found.FolderName.Contains(Path.AltDirectorySeparatorChar))
+            if (IsUnsafeFolderName(found.FolderName))
             {
                 found.FolderName = BuildFolderName(found.Label, found.Serial);
                 Save();
@@ -329,6 +397,17 @@ public static class SettingsStore
 
             return found;
         }
+    }
+
+    /// <summary>Имя подпапки небезопасно: содержит разделители, «..», недопустимые символы или является зарезервированным.</summary>
+    private static bool IsUnsafeFolderName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return true;
+        return PathSafety.IsReservedWindowsName(name) ||
+               name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+               name.Contains("..", StringComparison.Ordinal) ||
+               name.Contains(Path.DirectorySeparatorChar) ||
+               name.Contains(Path.AltDirectorySeparatorChar);
     }
 
     /// <summary>"USB_Метка_Serial" — безопасное для файловой системы имя подпапки.</summary>

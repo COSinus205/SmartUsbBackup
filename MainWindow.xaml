@@ -257,6 +257,7 @@
 
           <CheckBox x:Name="ChkStartup"  Content="Запускать с Windows" Checked="OnStartupChecked"  Unchecked="OnStartupUnchecked" />
           <CheckBox x:Name="ChkAutoUpdate" Content="Автообновление приложения" Checked="OnAutoUpdateChecked" Unchecked="OnAutoUpdateUnchecked" />
+          <CheckBox x:Name="ChkIncludeUsbFixed" Content="Включая USB-диски (HDD/SSD)" Checked="OnIncludeUsbFixedChecked" Unchecked="OnIncludeUsbFixedUnchecked" ToolTipService.ToolTip="Обрабатывать внешние жёсткие диски и SSD, подключённые по USB. Windows определяет их как фиксированные диски, поэтому по умолчанию они пропускаются." />
 
           <CheckBox x:Name="ChkMirror"   Content="Зеркало"             Checked="OnMirrorChecked"   Unchecked="OnMirrorUnchecked" />
           <CheckBox x:Name="ChkSkipHidden" Content="Пропускать скрытые/системные" Checked="OnSkipHiddenChecked" Unchecked="OnSkipHiddenUnchecked" ToolTipService.ToolTip="Влияет на то, какие файлы флешки включаются в синхронизацию." />

@@ -370,7 +370,8 @@ public sealed class FileSyncService
     // =====================================================================
 
     /// <summary>Файл изменился на флешке → скопировать только его в бэкап.</summary>
-    public async Task<bool> SyncSingleFileAsync(string srcFullPath, string sourceDir, string targetDir)
+    public async Task<bool> SyncSingleFileAsync(
+        string srcFullPath, string sourceDir, string targetDir, CancellationToken ct = default)
     {
         try
         {
@@ -379,11 +380,17 @@ public sealed class FileSyncService
             var rel = Path.GetRelativePath(sourceDir, srcFullPath);
             var dst = Path.Combine(targetDir, rel);
             Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
-            await CopyChunkedAsync(srcFullPath, dst, CancellationToken.None);
+            await CopyChunkedAsync(srcFullPath, dst, ct);
+            ct.ThrowIfCancellationRequested();
             var srcInfo = new FileInfo(srcFullPath);
             System.IO.File.SetLastWriteTimeUtc(dst, srcInfo.LastWriteTimeUtc);
             AppLog.Info($"[WATCH] Обновлён в бэкапе: {dst}");
             return true;
+        }
+        catch (OperationCanceledException)
+        {
+            AppLog.Info($"[WATCH] Копирование отменено (извлечение флешки): {srcFullPath}");
+            return false;
         }
         catch (Exception ex)
         {
@@ -504,8 +511,12 @@ public sealed class FileSyncService
     /// </summary>
     private sealed class TargetIndexCache
     {
-        public int Version { get; set; } = 1;
+        public int Version { get; set; } = 2;
         public long RootLastWriteUtcTicks { get; set; }
+
+        /// <summary>Относительный путь каталога → его LastWriteTimeUtc.Ticks.</summary>
+        public Dictionary<string, long> DirLastWriteUtcTicks { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
         public List<TargetIndexEntry> Entries { get; set; } = new();
     }
 
@@ -532,15 +543,53 @@ public sealed class FileSyncService
             var json = File.ReadAllText(path);
             var cache = System.Text.Json.JsonSerializer.Deserialize<TargetIndexCache>(
                 json, new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-            if (cache is null || cache.Version != 1) return null;
+            if (cache is null || cache.Version != 2) return null;
+
             var currentRoot = Directory.GetLastWriteTimeUtc(targetDir).Ticks;
             if (cache.RootLastWriteUtcTicks != currentRoot) return null;
+
+            // Проверяем mtime ВСЕХ каталогов приёмника: изменение файла меняет
+            // время его папки, поэтому устаревший индекс не будет использован.
+            var currentDirs = SnapshotDirTimes(targetDir);
+            if (currentDirs.Count != cache.DirLastWriteUtcTicks.Count) return null;
+            foreach (var kv in currentDirs)
+            {
+                if (!cache.DirLastWriteUtcTicks.TryGetValue(kv.Key, out var cachedTicks) ||
+                    cachedTicks != kv.Value)
+                {
+                    return null;
+                }
+            }
+
             return cache;
         }
         catch
         {
             return null;
         }
+    }
+
+    /// <summary>Относительный путь каталога ("" — корень) → LastWriteTimeUtc.Ticks.</summary>
+    private static Dictionary<string, long> SnapshotDirTimes(string root)
+    {
+        var result = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase)
+        {
+            [""] = Directory.GetLastWriteTimeUtc(root).Ticks,
+        };
+
+        var opts = new EnumerationOptions
+        {
+            RecurseSubdirectories = true,
+            IgnoreInaccessible = true,
+            AttributesToSkip = FileAttributes.ReparsePoint,
+        };
+
+        foreach (var dir in new DirectoryInfo(root).EnumerateDirectories("*", opts))
+        {
+            try { result[Path.GetRelativePath(root, dir.FullName)] = dir.LastWriteTimeUtc.Ticks; }
+            catch { /* каталог исчез во время обхода */ }
+        }
+        return result;
     }
 
     private static void SaveTargetIndexCache(string targetDir, Dictionary<string, FileKey> index)
@@ -551,6 +600,7 @@ public sealed class FileSyncService
             var cache = new TargetIndexCache
             {
                 RootLastWriteUtcTicks = Directory.GetLastWriteTimeUtc(targetDir).Ticks,
+                DirLastWriteUtcTicks = SnapshotDirTimes(targetDir),
                 Entries = index.Select(kv => new TargetIndexEntry
                 {
                     Path = kv.Key,
@@ -564,8 +614,7 @@ public sealed class FileSyncService
             var final = GetTargetIndexCachePath(targetDir);
             var tmp = final + "." + Guid.NewGuid().ToString("N") + ".tmp";
             File.WriteAllText(tmp, System.Text.Json.JsonSerializer.Serialize(cache, new System.Text.Json.JsonSerializerOptions { WriteIndented = false }));
-            if (File.Exists(final)) File.Delete(final);
-            File.Move(tmp, final);
+            File.Move(tmp, final, overwrite: true);
         }
         catch
         {
@@ -575,7 +624,9 @@ public sealed class FileSyncService
 
     private async Task CopyChunkedAsync(string src, string dst, CancellationToken ct)
     {
-        var tmp = dst + ".tmp";
+        // Уникальный tmp: параллельные копии одного файла (live-watch + полный прогон)
+        // не должны писать в один и тот же временный файл.
+        var tmp = dst + "." + Guid.NewGuid().ToString("N") + ".tmp";
 
         try
         {
@@ -627,7 +678,12 @@ public sealed class FileSyncService
     {
         try
         {
-            var opts = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
+            var opts = new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                IgnoreInaccessible = true,
+                AttributesToSkip = FileAttributes.ReparsePoint,
+            };
             foreach (var dir in Directory.EnumerateDirectories(root, "*", opts)
                                            .OrderByDescending(d => d.Length)) // с глубоких к корню
             {

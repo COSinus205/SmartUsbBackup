@@ -70,6 +70,48 @@ public static class UpdateService
             v.Revision >= 0 ? v.Revision : 0);
 
     /// <summary>
+    /// Приводит версию к Major.Minor.Build: «4.3.1» и «4.3.1.0» — одна и та же версия.
+    /// Без этого сравнение тега релиза (4.3.1) с AssemblyVersion (4.3.1.0) даёт
+    /// ложное «установлена более новая версия».
+    /// </summary>
+    public static Version Normalize(Version? version)
+    {
+        if (version is null) return new Version(0, 0, 0);
+        return new Version(
+            Math.Max(version.Major, 0),
+            Math.Max(version.Minor, 0),
+            Math.Max(version.Build, 0));
+    }
+
+    /// <summary>Сравнение версий с нормализацией: &lt;0, 0, &gt;0 — как у Version.CompareTo.</summary>
+    public static int Compare(Version? left, Version? right)
+        => Normalize(left).CompareTo(Normalize(right));
+
+    /// <summary>Удалённая версия новее текущей.</summary>
+    public static bool IsNewer(Version? current, Version? remote)
+        => Compare(remote, current) > 0;
+
+    /// <summary>Строковый вариант сравнения (теги вида "v4.3.1").</summary>
+    public static bool IsNewer(string? current, string? remote)
+    {
+        if (!TryParseVersion(current, out var currentVersion)) return false;
+        if (!TryParseVersion(remote, out var remoteVersion)) return false;
+        return IsNewer(currentVersion, remoteVersion);
+    }
+
+    private static bool TryParseVersion(string? text, out Version version)
+    {
+        if (Version.TryParse((text ?? string.Empty).Trim().TrimStart('v', 'V'), out var parsed) && parsed is not null)
+        {
+            version = parsed;
+            return true;
+        }
+
+        version = new Version(0, 0, 0);
+        return false;
+    }
+
+    /// <summary>
     /// Возвращает true только для ожидаемого безопасного имени asset'а.
     /// SEC: A-01
     /// </summary>
@@ -283,9 +325,11 @@ public static class UpdateService
                     if (!IsExpectedAssetName(name))
                         continue;
 
-                    // Если имя содержит версию — она должна совпадать с тегом релиза.
+                    // Если имя содержит версию — она должна совпадать с тегом релиза
+                    // (сравниваем нормализованно: 4.3.1 == 4.3.1.0).
                     var m = Regex.Match(name, @"SmartUsbBackup-Setup-(\d+\.\d+\.\d+)\.exe", RegexOptions.CultureInvariant);
-                    if (m.Success && Version.TryParse(m.Groups[1].Value, out var assetVersion) && assetVersion != version)
+                    if (m.Success && Version.TryParse(m.Groups[1].Value, out var assetVersion) &&
+                        Compare(assetVersion, version) != 0)
                         continue;
 
                     if (!a.TryGetProperty("browser_download_url", out var urlProp))
@@ -345,10 +389,10 @@ public static class UpdateService
                 }
             }
 
-            // SEC: A-02 — отсутствие хеша больше не отказ автоматически; решение принимает пользователь (диалог в UI).
+            // SEC: A-02 — без хеша автообновление недоступно (UI сообщит пользователю).
             if (string.IsNullOrWhiteSpace(sha256))
             {
-                AppLog.Warn("SEC A-02: в ответе API отсутствует SHA-256 для asset'а " + assetName + " — обновление помечено как непроверенное");
+                AppLog.Warn("SEC A-02: в ответе API отсутствует SHA-256 для asset'а " + assetName + " — автообновление недоступно");
             }
 
             return new UpdateInfo(version, tag, url!, size, assetName, sha256) { HtmlUrl = htmlUrl };
@@ -382,7 +426,7 @@ public static class UpdateService
     }
 
     public static async Task<string?> DownloadAsync(
-        UpdateInfo info, IProgress<double>? progress = null, CancellationToken ct = default, bool allowUnverified = false)
+        UpdateInfo info, IProgress<double>? progress = null, CancellationToken ct = default)
     {
         if (!IsExpectedAssetName(info.AssetName))
         {
@@ -394,10 +438,11 @@ public static class UpdateService
             AppLog.Warn("SEC A-03: отклонён URL загрузки: " + info.DownloadUrl);
             return null;
         }
-        // SEC: A-02 — без хеша отказ по умолчанию; allowUnverified только после явного согласия пользователя.
-        if (string.IsNullOrWhiteSpace(info.Sha256) && !allowUnverified)
+        // SEC: A-02 — обновление без SHA-256 не принимаем: целостность
+        // подтверждается только хешем, обхода «на свой риск» больше нет.
+        if (string.IsNullOrWhiteSpace(info.Sha256))
         {
-            AppLog.Warn("SEC A-02: обновление без SHA-256 — отказ (allowUnverified=false)");
+            AppLog.Warn("SEC A-02: обновление без SHA-256 — отказ");
             return null;
         }
 
@@ -439,24 +484,16 @@ public static class UpdateService
             await dst.FlushAsync(ct);
             dst.Close();
 
-            // SEC: A-02 — SHA-256 проверяем только если он известен (иначе — только по согласию пользователя).
-            if (!string.IsNullOrWhiteSpace(info.Sha256))
+            // SEC: A-02 — SHA-256 обязателен (проверен выше).
+            var shaOk = await VerifySha256Async(tmp, info.Sha256!, ct);
+            if (!shaOk)
             {
-                var shaOk = await VerifySha256Async(tmp, info.Sha256, ct);
-                if (!shaOk)
-                {
-                    AppLog.Error(null, "SEC A-02: SHA-256 не совпал — файл удалён");
-                    try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
-                    return null;
-                }
-            }
-            else
-            {
-                AppLog.Warn("SEC A-02: SHA-256 недоступен — проверка пропущена (allowUnverified)");
+                AppLog.Error(null, "SEC A-02: SHA-256 не совпал — файл удалён");
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                return null;
             }
 
-            if (File.Exists(target)) File.Delete(target);
-            File.Move(tmp, target);
+            File.Move(tmp, target, overwrite: true);
             return target;
         }
         catch
@@ -510,17 +547,33 @@ public static class UpdateService
     /// <summary>
     /// Внутренняя механика запуска установщика (через cmd с задержкой).
     /// Используется и в продакшен-пути (после WinTrust), и во временных тестах.
+    /// <paramref name="restartHidden"/> — перезапустить приложение скрыто (как оно
+    /// работало в автозагрузке), иначе покажется окно.
     /// </summary>
-    public static bool ApplyUpdateCore(string installerPath)
+    public static bool ApplyUpdateCore(string installerPath, bool restartHidden = false)
     {
         try
         {
+            // После silent-установки Inno не запускает приложение ([Run] skipifsilent),
+            // поэтому перезапуск делаем сами — уже после завершения установщика.
+            string restart = string.Empty;
+            try
+            {
+                var exe = Environment.ProcessPath;
+                if (!string.IsNullOrWhiteSpace(exe) && File.Exists(exe))
+                    restart = " & start \"\" \"" + exe + "\"" + (restartHidden ? " -hidden" : string.Empty);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Warn("Не удалось определить путь к приложению для перезапуска: " + ex.Message);
+            }
+
             // Установщик запускается отдельным cmd с задержкой ~2 с, чтобы дать
             // приложению завершить штатную очистку и освободить файлы до копирования.
             var psi = new ProcessStartInfo
             {
                 FileName = "cmd.exe",
-                Arguments = $"/c timeout 2 >nul & \"{installerPath}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
+                Arguments = $"/c timeout 2 >nul & \"{installerPath}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART{restart}",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden
@@ -540,7 +593,7 @@ public static class UpdateService
     /// чтобы инсталлятор не зависел от времени жизни текущего процесса.
     /// Возвращает true, если процесс установщика удалось запустить.
     /// </summary>
-    public static bool ApplyUpdate(string installerPath)
+    public static bool ApplyUpdate(string installerPath, bool restartHidden = false)
     {
         // SEC: A-02 — проверка Authenticode перед запуском.
         if (!WinTrust.Verify(installerPath))
@@ -549,6 +602,6 @@ public static class UpdateService
             return false;
         }
 
-        return ApplyUpdateCore(installerPath);
+        return ApplyUpdateCore(installerPath, restartHidden);
     }
 }

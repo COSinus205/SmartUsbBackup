@@ -290,7 +290,7 @@ public sealed class SafeRemovalStateTests
     }
 
     [Fact]
-    public async Task QueryRemove_DuringCopyChunkedAsync_ClosesHandlesWithinBudget_ReturnsTrue()
+    public void QueryRemove_DuringCopyChunkedAsync_ClosesHandlesWithinBudget_ReturnsTrue()
     {
         var orchestrator = new BackupOrchestrator();
         var root = NewTempRoot();
@@ -359,6 +359,9 @@ public sealed class SafeRemovalStateTests
     [Fact]
     public async Task UsePollingInIdleFalse_BaselineNotTaken()
     {
+        // OnArrived создаёт профиль и сохраняет настройки — не трогаем реальные данные.
+        using var isolation = new SettingsIsolation();
+
         var old = SettingsStore.Current.UsePollingInIdle;
         try
         {
@@ -383,7 +386,7 @@ public sealed class SafeRemovalStateTests
     }
 
     [Fact]
-    public void DetachRequested_PollingDoesNotStartNewEnumeration()
+    public async Task DetachRequested_PollingDoesNotStartNewEnumeration()
     {
         var root = NewTempRoot();
         var session = NewSession(root);
@@ -391,7 +394,7 @@ public sealed class SafeRemovalStateTests
 
         var method = typeof(BackupOrchestrator).GetMethod("PollSessionAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
         var task = (Task)method.Invoke(new BackupOrchestrator(), new object[] { session })!;
-        task.GetAwaiter().GetResult();
+        await task;
 
         Assert.False(session.PendingChanges);
     }
@@ -402,19 +405,12 @@ public sealed class SafeRemovalStateTests
         var orchestrator = new BackupOrchestrator();
         var profile = new DriveProfile { Label = "RunTest", Serial = "9999", FolderName = "USB_RUN_9999", Enabled = false, DriveLetter = 'D' };
         var session = NewSessionForLetter('D', profile);
-        var cancelFile = Path.Combine("C:\\", "__runtest_cancel.bin");
-        try
-        {
-            session.BeginDetachForSafeRemoval(out _, out _);
-            var task = orchestrator.RunDriveSettingsTest(profile, 'D', null, session.DetachCts.Token);
 
-            var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => task);
-            Assert.NotNull(ex);
-        }
-        finally
-        {
-            try { File.Delete(cancelFile); } catch { }
-        }
+        session.BeginDetachForSafeRemoval(out _, out _);
+        var task = orchestrator.RunDriveSettingsTest(profile, 'D', null, session.DetachCts.Token);
+
+        var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => task);
+        Assert.NotNull(ex);
     }
 
     [Fact]

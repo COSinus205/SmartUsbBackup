@@ -1,23 +1,23 @@
-﻿# Smart USB Backup 4.3.1 (WinUI 3)
+﻿# Smart USB Backup 4.3.2 (WinUI 3)
 
-![CI](https://github.com/COSinus205/SmartUsbBackup/actions/workflows/dotnet.yml/badge.svg)
+![CI](https://github.com/COSinus205/SmartUsbBackup/actions/workflows/ci.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![.NET 8](https://img.shields.io/badge/.NET-8-512BD4)
 ![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D4)
 
 Современное приложение для зеркального резервного копирования USB-флешек. В режиме ожидания приложение не держит постоянных дескрипторов на флешке; изменения отслеживаются лёгким polling с настраиваемым интервалом (по умолчанию 30 секунд), что обеспечивает корректную работу «Безопасного извлечения» в Windows.
 
-> **Версия 4.3.1** — патч-релиз (patch bump по SemVer): только производительность и накладные расходы. Функциональность и формат `settings.json` не меняются. Из заметного: `DefaultFlushAfterFile` теперь по умолчанию выключен (копия остаётся атомарной через `.tmp` → `Move`).
+> **Версия 4.3.2** — исправления и небольшие улучшения: безопасная проверка путей хранения (включая персональные папки профилей), корректное сравнение версий при обновлении, обязательный SHA-256 для автообновления, поддержка внешних USB HDD/SSD, перенос существующих копий при смене папки и более информативный деинсталлятор. Формат `settings.json` совместим с 4.3.1.
 
-> **Последний релиз — 4.3.1.**
+> **Последний релиз — 4.3.2.**
 
 <div align="center">
-  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.3.1">
-    <img src="https://img.shields.io/badge/Download%20installer-4.3.1-blue?style=for-the-badge" alt="Download Smart USB Backup 4.3.1 installer">
+  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.3.2">
+    <img src="https://img.shields.io/badge/Download%20installer-4.3.2-blue?style=for-the-badge" alt="Download Smart USB Backup 4.3.2 installer">
   </a>
 </div>
 
-> Latest installer: [SmartUsbBackup-Setup-4.3.1.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.3.1)
+> Latest installer: [SmartUsbBackup-Setup-4.3.2.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.3.2)
 
 ## Основные возможности
 
@@ -25,6 +25,7 @@
 - Зеркальное копирование с проверкой CRC и режимом «залить как есть».
 - Настраиваемые профили для каждой флешки: зеркало, CRC32, автозапуск, обновление сразу при подключении.
 - Персональные вкладки настроек для каждой флешки.
+- Поддержка обычных флешек и (опционально) внешних USB HDD/SSD.
 - Адаптивный Fluent-интерфейс с вкладками, тёмной/светлой темой и Mica.
 - Работа в фоне и из системного трея, автопроверка обновлений.
 
@@ -52,15 +53,15 @@ dotnet build -c Release
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\SmartUsbBackup.iss
 ```
 
-Результат: `installer/dist/SmartUsbBackup-Setup-4.3.1.exe`.
+Результат: `installer/dist/SmartUsbBackup-Setup-4.3.2.exe`.
 
-Установка per-user, без прав администратора. При удалении предлагается выбрать, какие копии флешек удалить.
+Установка per-user, без прав администратора. При удалении предлагается выбрать, какие копии флешек удалить (в списке — полные пути, включая персональные папки профилей).
 
 ## Безопасное извлечение (safe-remove)
 
 - `FileSystemWatcher` не создаётся в конструкторе сессии и не удерживается на флешке постоянно. Watcher открывается только на время активной синхронизации и закрывается после её завершения.
 - В простое отслеживание изменений идёт через лёгкий **polling**: периодический обход корня и папок первого уровня с расчётом подписи (количество элементов, `LastWriteTime`, размер). Хэндлы на том не удерживаются, поэтому «Безопасное извлечение» в Windows в типичном сценарии «вставил — извлёк» проходит без «Устройство занято».
-- При получении `DBT_DEVICEQUERYREMOVE` / `DBT_DEVICEQUERYREMOVEFAILED` / `DBT_DEVICEQUERYREMOVEPENDING` приложение останавливает синхронизацию и освобождает хэндлы в пределах таймаута 1500 мс (`BROADCAST_QUERY_DENY` при превышении).
+- При получении `DBT_DEVICEQUERYREMOVE` / `DBT_DEVICEQUERYREMOVEFAILED` / `DBT_DEVICEQUERYREMOVEPENDING` приложение останавливает синхронизацию и освобождает хэндлы в пределах таймаута 2000 мс (`BROADCAST_QUERY_DENY` при превышении).
 - `ConnectedSession` идемпотентен при повторном `Dispose`; `ConnectedSession.FileWatcher` может быть `null` (watcher создаётся лениво). `RunDriveSettingsTest` принимает session-scoped `CancellationToken`, отменяемый при `BeginDetachForSafeRemoval`.
 
 Если Windows всё равно показывает «Устройство занято»:
@@ -107,16 +108,16 @@ dotnet build -c Release
 | `Interop/NativeMethods.cs` | Win32-interop/helper'ы (ShowWindow, SetForegroundWindow и др.). |
 | `Interop/WindowMinSize.cs` | Минимальный размер окна через `WM_GETMINMAXINFO`. |
 | `Properties/AssemblyInfo.cs` | `InternalsVisibleTo("SmartUsbBackup.Tests")`. |
-| `SmartUsbBackup.Tests/` | xUnit-тесты: 71 тестовый случай (30 `[Fact]`, 7 `[Theory]`/41 `[InlineData]`). |
+| `SmartUsbBackup.Tests/` | xUnit-тесты: 92 тестовых случая (47 `[Fact]`, 8 `[Theory]`/45 `[InlineData]`). |
 | `installer/SmartUsbBackup.iss` | Скрипт Inno Setup (per-user install, деинсталляция, Pascal Script). |
-| `installer/dist/SmartUsbBackup-Setup-4.3.1.exe` | Собранный установщик (релиз). |
+| `installer/dist/SmartUsbBackup-Setup-4.3.2.exe` | Собранный установщик (релиз). |
 | `CHANGELOG.md` | История изменений. |
 
 > Тестовый харнесс `ejecttest` **не входит в репозиторий**; для локальных копий действуют правила `.gitignore` (`tools/ejecttest/`, `ejecttest/`, `*.ejecttest.*`).
 
 ## CI / Сборка
 
-![CI](https://github.com/COSinus205/SmartUsbBackup/actions/workflows/dotnet.yml/badge.svg)
+![CI](https://github.com/COSinus205/SmartUsbBackup/actions/workflows/ci.yml/badge.svg)
 
 Запуск тестов локально:
 
@@ -124,7 +125,7 @@ dotnet build -c Release
 dotnet test SmartUsbBackup.Tests/SmartUsbBackup.Tests.csproj
 ```
 
-Все 71 тестовый случай (30 `[Fact]` + 41 `[InlineData]` в 7 `[Theory]`).
+Все 92 тестовых случая (47 `[Fact]` + 45 `[InlineData]` в 8 `[Theory]`).
 
 Сборка без Visual Studio:
 
@@ -135,8 +136,8 @@ dotnet build SmartUsbBackup.WinUI.csproj -c Release -p:Platform=x64
 ## Безопасность
 
 Проверяется при автообновлении:
-- SHA-256 скачанного файла (обязательно; при несовпадении — отказ).
-- Authenticode-подпись (сейчас в режиме предупреждения, так как сертификат ещё не получен; при появлении сертификата станет обязательной).
+- SHA-256 скачанного файла (обязательно; без хеша обновление не предлагается, при несовпадении — отказ).
+- Authenticode-подпись, если она есть. Сертификат издателя пока не получен, поэтому отсутствие подписи не блокирует установку (целостность уже подтверждена SHA-256); подпись будет включена как обязательная после получения сертификата.
 - allowlist хостов загрузки (только `github.com` и GitHub CDN).
 
 Осознанно НЕ проверяется:

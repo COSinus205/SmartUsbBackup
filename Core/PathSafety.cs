@@ -37,6 +37,40 @@ public static class PathSafety
         return fullCandidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>Строго внутри каталога (равенство запрещено).</summary>
+    public static bool IsInsideDirectory(string basePath, string candidatePath)
+        => IsSafeSubPath(basePath, candidatePath);
+
+    /// <summary>Совпадает с каталогом или находится внутри него.</summary>
+    public static bool IsInsideOrEqual(string basePath, string candidatePath)
+    {
+        if (IsSafeSubPath(basePath, candidatePath)) return true;
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(basePath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                Path.GetFullPath(candidatePath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Пути находятся на одном томе. При ошибке возвращает true (fail-closed):
+    /// для проверки «бэкап не должен лежать на флешке» это безопасный ответ.
+    /// </summary>
+    public static bool IsSameVolume(string pathA, string pathB)
+    {
+        try
+        {
+            var rootA = Path.GetPathRoot(Path.GetFullPath(pathA));
+            var rootB = Path.GetPathRoot(Path.GetFullPath(pathB));
+            if (string.IsNullOrEmpty(rootA) || string.IsNullOrEmpty(rootB)) return true;
+            return string.Equals(rootA, rootB, StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return true; }
+    }
+
     public static bool ContainsReparsePoint(string path)
     {
         if (string.IsNullOrWhiteSpace(path))
