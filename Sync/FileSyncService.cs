@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -14,13 +15,11 @@ public enum SyncPhase
 {
     Idle,       // ничего не происходит
     Connecting, // подключение/чтение метаданных флешки
-    Scanning,   // строим список файлов (быстро: ничего не читаем напрямую)
-    Copying,    // копируем глубину
+    Scanning,   // строим список файлов
+    Copying,    // копируем
     Pruning,    // «зеркало»: удаляем файлы, исчезнувшие на флешке
     Wipe,       // удаление бэкапа флешки
     Moving,     // перенос бэкапа флешки в другую папку
-    LiveWatch,  // ожидание изменений в фоне (live watch)
-    Testing,    // однократный тест настроек при первом подключении (только чтение)
     Cancelled,  // пользователь/система отменили операцию
     Completed,  // синхронизация завершена успешно
     Error,      // произошла ошибка
@@ -50,398 +49,23 @@ public sealed record SyncProgress(
 /// <summary>Итог одного прогона синхронизации.</summary>
 public sealed record SyncResult(int Copied, int Deleted, int Skipped, long BytesCopied, string? Error);
 
-/// <summary>
-/// Ключ сравнения файлов: «Размер + Дата изменения в UTC».
-/// Дешёвое сравнение без чтения содержимого (конкретная стратегия инкрементальности).
-/// CRC32 подключается только как вторая проверка при verifyByCrc = true.
-/// </summary>
+/// <summary>Ключ сравнения файлов: «Размер + Дата изменения в UTC».</summary>
 internal readonly record struct FileKey(long Size, DateTime LastWriteUtc);
 
 /// <summary>
 /// «Двигатель» зеркального резервного копирования одной флешки.
-///
-/// Стратегия низкого потребления ресурсов:
-///   • Запускается только ПО СОБЫТИЮ (подключение флешки; изменение файла от FileSystemWatcher).
-///   • Дерево читается EnumerationOptions (Metadata-операции, без открытия содержимого).
-///   • Инкрементальность: сравнение Size+LastWriteUtc, CRC32 — только для «подозрительных» пар.
-///   • Чтение/запись чанками по 256 КБ с ArrayPool (нулевые аллокации в цикле копирования).
-///   • Бэкап пишется во временный файл .tmp и атомарно переименовывается —
-///     копия никогда не остаётся в «недокопированном» состоянии.
+/// Всегда зеркало: то, чего нет на флешке, удаляется из бэкапа.
+/// Сравнение — только по размеру и дате (содержимое не читается).
 /// </summary>
 public sealed class FileSyncService
 {
-    /// <summary>Размер буфера копирования, байт. 256 КБ — «золотая середина» для USB-накопителей.</summary>
-    private const int CHUNK = 4 * 1024 * 1024;  // 4 MБ — быстрее на USB-накопителях
+    private const int BufferSize = 1024 * 1024;
 
-    private readonly bool _mirror;
-    private readonly bool _verifyByCrc;
-    private readonly bool _skipHiddenSystem;
-    private readonly int _bufferSize;
-    private readonly bool _flushAfterFile;
-    private readonly bool _fastSmallFileCopy;
-    private readonly bool _useTargetIndexCache;
-
-    /// <summary>Кэш метаданных файла (избегаем повторного FileInfo в цикле копирования).</summary>
-    private readonly record struct FileMeta(string Path, long Size, DateTime LastWriteUtc);
-
-    public FileSyncService(bool mirror, bool verifyByCrc, bool skipHiddenSystem, int bufferSizeKb = 4096, bool flushAfterFile = true, bool fastSmallFileCopy = false, bool useTargetIndexCache = true)
-    {
-        _mirror = mirror;
-        _verifyByCrc = verifyByCrc;
-        _skipHiddenSystem = skipHiddenSystem;
-        _bufferSize = Math.Clamp(bufferSizeKb * 1024, 64 * 1024, 16 * 1024 * 1024);
-        _flushAfterFile = flushAfterFile;
-        _fastSmallFileCopy = fastSmallFileCopy;
-        _useTargetIndexCache = useTargetIndexCache;
-    }
-
-    // =====================================================================
-    //  ПОЛНАЯ синхронизация (при подключении флешки / кнопке «Синхронизировать»)
-    // =====================================================================
-
-    /// <summary>
-    /// Зеркалирует <paramref name="sourceDir"/> (флешка) → <paramref name="targetDir"/> (бэкап).
-    /// Работает на фоне (async/await), прогресс — через IProgress&lt;SyncProgress&gt; (маршалинг в UI).
-    /// </summary>
-    public async Task<SyncResult> SyncAllAsync(
-        string sourceDir, string targetDir,
-        IProgress<SyncProgress>? progress, CancellationToken ct)
-    {
-        if (!Directory.Exists(sourceDir))
-            return new SyncResult(0, 0, 0, 0, "Флешка отключена");
-
-        List<FileMeta> sourceFiles;
-        long totalBytes;
-        HashSet<string> inaccessibleDirs;
-        try
-        {
-            sourceFiles = SnapshotFiles(sourceDir, progress, out inaccessibleDirs);
-            totalBytes = 0;
-            foreach (var f in sourceFiles)
-            {
-                totalBytes += f.Size;
-            }
-        }
-        catch (Exception ex)
-        {
-            AppLog.Error(ex, $"Не удалось просканировать {sourceDir}");
-            return new SyncResult(0, 0, 0, 0, $"Ошибка сканирования: {ex.Message}");
-        }
-
-        var sw = Stopwatch.StartNew();
-        int copied = 0, skipped = 0;
-        long bytesCopied = 0;
-
-        // Индекс приёмной стороны для O(1)-сравнения по относительному пути.
-        var targetIndex = BuildTargetIndex(targetDir);
-        if (_useTargetIndexCache) SaveTargetIndexCache(targetDir, targetIndex);
-
-        progress?.Report(new SyncProgress('\0', 0, sourceFiles.Count, 0, 0, 0, totalBytes, "", SyncPhase.Scanning));
-
-        // Предварительное создание всех целевых каталогов + учёт уже созданных:
-        // CreateDirectory — это syscall, не нужно повторять его на каждый файл.
-        var targetDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var fm in sourceFiles)
-        {
-            targetDirs.Add(Path.GetDirectoryName(Path.Combine(targetDir, Path.GetRelativePath(sourceDir, fm.Path)))!);
-        }
-        var createdDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var d in targetDirs)
-        {
-            try
-            {
-                Directory.CreateDirectory(d);
-                createdDirs.Add(d);
-            }
-            catch { /* будет повторная попытка перед конкретным файлом */ }
-        }
-
-        // Троттлинг UI-прогресса: лимит 1 отчёт на 100 мс или при сдвиге на 1%.
-        var progressStopwatch = Stopwatch.StartNew();
-        int lastReportedPercent = 0;
-
-        for (int i = 0; i < sourceFiles.Count; i++)
-        {
-            ct.ThrowIfCancellationRequested();
-
-            // Флешку вынули прямо во время копирования: дальше перебирать 14 000
-            // файлов и логировать ошибки бессмысленно — мгновенно выходим.
-            if ((i & 0x7F) == 0 && !Directory.Exists(sourceDir))
-            {
-                AppLog.Warn("Флешка отключена во время синхронизации — копирование остановлено");
-                return new SyncResult(copied, 0, skipped, bytesCopied, "Флешка отключена");
-            }
-
-            var srcMeta = sourceFiles[i];
-            var srcPath = srcMeta.Path;
-            try
-            {
-                var rel = Path.GetRelativePath(sourceDir, srcPath);
-                var dstPath = Path.Combine(targetDir, rel);
-
-                var srcKey = new FileKey(srcMeta.Size, srcMeta.LastWriteUtc);
-
-                var dstKey = targetIndex.TryGetValue(rel, out var k) ? (FileKey?)k : null;
-
-                bool needsCopy =
-                    dstKey is null ||                                            // новый файл
-                    dstKey.Value != srcKey ||                                    // размер/дата изменились
-                    (_verifyByCrc && !await Crc32.AreEqualAsync(srcPath, dstPath, ct)); // глубокая проверка
-
-                if (!needsCopy)
-                {
-                    skipped++;
-                }
-                else
-                {
-                    var dstDir = Path.GetDirectoryName(dstPath)!;
-                    if (!createdDirs.Contains(dstDir))
-                    {
-                        // Папка ещё не создана (или предварительное создание не удалось):
-                        // повторяем попытку, но не чаще одного раза на каталог.
-                        Directory.CreateDirectory(dstDir);
-                        createdDirs.Add(dstDir);
-                    }
-
-                    // Мелкие файлы выгоднее копировать силами ядра ОС (CopyFile): меньше
-                    // managed-накладных расходов, а mtime/ctime переносятся автоматически.
-                    bool copiedByOs = _fastSmallFileCopy && srcMeta.Size > 0 && srcMeta.Size <= 4 * 1024 * 1024;
-                    if (copiedByOs)
-                    {
-                        System.IO.File.Copy(srcPath, dstPath, overwrite: true);
-                    }
-                    else
-                    {
-                        await CopyChunkedAsync(srcPath, dstPath, ct);
-
-                        // .tmp → Move сохраняет время записи самого .tmp, поэтому возвращаем
-                        // дату источника: иначе следующий прогон снова сочтёт файл новым.
-                        System.IO.File.SetLastWriteTimeUtc(dstPath, srcMeta.LastWriteUtc);
-                    }
-
-                    copied++;
-                    bytesCopied += srcMeta.Size;
-                    targetIndex[rel] = srcKey; // копия теперь идентична источнику
-                }
-
-                // Троттлинг прогресса: не чаще 1 раза в 100 мс, либо при изменении
-                // процента завершения хотя бы на 1% (что наступит раньше).
-                int currentPercent = totalBytes > 0
-                    ? (int)(bytesCopied * 100L / totalBytes)
-                    : (i == sourceFiles.Count - 1 ? 100 : 0);
-
-                if (progress is not null)
-                {
-                    bool shouldReport = currentPercent != lastReportedPercent ||
-                                       progressStopwatch.ElapsedMilliseconds >= 100;
-                    if (shouldReport)
-                    {
-                        progress.Report(new SyncProgress('\0', i + 1, sourceFiles.Count,
-                            copied, skipped, bytesCopied, totalBytes, srcPath, SyncPhase.Copying));
-                        lastReportedPercent = currentPercent;
-                        progressStopwatch.Restart();
-                    }
-                }
-
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception ex)
-            {
-                AppLog.Error(ex, $"Не удалось скопировать {srcPath}");
-
-                // Причина ошибки — носитель исчез: не продолжаем «в пустоту».
-                if (!Directory.Exists(sourceDir))
-                {
-                    AppLog.Warn("Флешка отключена во время синхронизации — копирование остановлено");
-                    return new SyncResult(copied, 0, skipped, bytesCopied, "Флешка отключена");
-                }
-            }
-        }
-
-        int deleted = 0;
-        if (_mirror)
-        {
-            // SEC: B-04 — удалять только внутри targetDir, без reparse points.
-            var fullTargetDir = Path.GetFullPath(targetDir);
-            // Защита от удаления корня диска/системной папки.
-            var root = Path.GetPathRoot(fullTargetDir);
-            if (string.IsNullOrWhiteSpace(root) ||
-                string.Equals(fullTargetDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
-                             root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
-                             StringComparison.OrdinalIgnoreCase))
-            {
-                AppLog.Error(null, "SEC B-04: mirror pruning отменён — targetDir является корнем");
-            }
-            else
-            {
-                // Множество файлов, присутствующих на флешке (по относительному пути).
-                var expectedOnSource = new HashSet<string>(
-                    sourceFiles.Select(s => Path.GetRelativePath(sourceDir, s.Path)),
-                    StringComparer.OrdinalIgnoreCase);
-
-                // BUG-02: файлы под каталогами, недоступными при сканировании, отсутствуют
-                // в снимке не из-за удаления. Удалять их из бэкапа нельзя.
-                var protectedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var d in inaccessibleDirs)
-                {
-                    try { protectedDirs.Add(Path.GetRelativePath(sourceDir, d)); }
-                    catch { /* вне sourceDir — не наш случай */ }
-                }
-                int protectedSkipped = 0;
-
-                var sep = Path.DirectorySeparatorChar;
-                var prefix = fullTargetDir.TrimEnd(sep) + sep;
-
-                var toDelete = new List<string>();
-                foreach (var rel in targetIndex.Keys)
-                {
-                    if (expectedOnSource.Contains(rel)) continue;
-                    if (IsUnderAnyDir(rel, protectedDirs)) { protectedSkipped++; continue; }
-
-                    string dst;
-                    try { dst = Path.GetFullPath(Path.Combine(fullTargetDir, rel)); }
-                    catch { AppLog.Error(null, "SEC B-04: некорректный путь: " + rel); continue; }
-
-                    if (!dst.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                    {
-                        AppLog.Error(null, "SEC B-04: отказ удаления вне targetDir: " + dst);
-                        continue;
-                    }
-                    if (PathSafety.ContainsReparsePoint(dst))
-                    {
-                        AppLog.Error(null, "SEC B-04: отказ удаления — reparse point: " + dst);
-                        continue;
-                    }
-
-                    toDelete.Add(rel);
-                }
-
-                if (protectedSkipped > 0)
-                    AppLog.Warn($"[MIRROR] Не удалено файлов: {protectedSkipped} — их каталог был недоступен при сканировании");
-
-                int totalToPrune = toDelete.Count;
-                progress?.Report(new SyncProgress('\0', 0, totalToPrune, copied, skipped, 0, totalToPrune, "", SyncPhase.Pruning));
-
-                int pruned = 0;
-                var pruneSw = Stopwatch.StartNew();
-
-                // В лог пишем не каждое удаление (при зеркалировании их бывают тысячи),
-                // а одну сводную строку с парой примеров.
-                var mirrorExamples = new List<string>(3);
-
-                foreach (var rel in toDelete)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    string dst = Path.GetFullPath(Path.Combine(fullTargetDir, rel));
-
-                    try
-                    {
-                        System.IO.File.Delete(dst);
-                        deleted++;
-                        pruned++;
-                        if (_useTargetIndexCache) targetIndex.Remove(rel);
-                        if (mirrorExamples.Count < 3) mirrorExamples.Add(dst);
-
-                        // Троттлинг: тысячи удалений не должны «затапливать» UI-поток
-                        // отдельным отчётом на каждый файл.
-                        if (progress is not null && (pruned % 128 == 0 || pruneSw.ElapsedMilliseconds >= 150))
-                        {
-                            progress.Report(new SyncProgress('\0', pruned, totalToPrune, copied, skipped, pruned, totalToPrune, dst, SyncPhase.Pruning));
-                            pruneSw.Restart();
-                        }
-                    }
-                    catch (Exception ex) { AppLog.Error(ex, $"Не удалось удалить {dst}"); }
-                }
-
-                if (pruned > 0)
-                {
-                    var examples = mirrorExamples.Count > 0
-                        ? "; например: " + string.Join("; ", mirrorExamples)
-                        : "";
-                    AppLog.Info($"[MIRROR] Удалено файлов: {pruned}{examples}");
-                }
-
-                if (progress is not null && pruned > 0 && pruned != totalToPrune)
-                    progress.Report(new SyncProgress('\0', pruned, totalToPrune, copied, skipped, pruned, totalToPrune, "", SyncPhase.Pruning));
-
-                CleanupEmptyDirs(fullTargetDir);
-            }
-        }
-
-        if (_useTargetIndexCache) SaveTargetIndexCache(targetDir, targetIndex);
-
-        progress?.Report(new SyncProgress('\0', sourceFiles.Count, sourceFiles.Count,
-            copied, skipped, bytesCopied, totalBytes, "", SyncPhase.Completed));
-
-        AppLog.Info(
-            $"SyncAll {sourceDir} → {targetDir}: копий {copied}, пропущено {skipped}, " +
-            $"удалено {deleted}, {bytesCopied / 1048576.0:F1} МБ, {sw.Elapsed.TotalSeconds:F1} c");
-
-        return new SyncResult(copied, deleted, skipped, bytesCopied, null);
-    }
-
-    // =====================================================================
-    //  ИНКРЕМЕНТАЛЬНАЯ синхронизация ОДНОГО файла (событие FileSystemWatcher)
-    // =====================================================================
-
-    /// <summary>Файл изменился на флешке → скопировать только его в бэкап.</summary>
-    public async Task<bool> SyncSingleFileAsync(
-        string srcFullPath, string sourceDir, string targetDir, CancellationToken ct = default)
-    {
-        try
-        {
-            if (!System.IO.File.Exists(srcFullPath)) return false;
-
-            var rel = Path.GetRelativePath(sourceDir, srcFullPath);
-            var dst = Path.Combine(targetDir, rel);
-            Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
-            await CopyChunkedAsync(srcFullPath, dst, ct);
-            ct.ThrowIfCancellationRequested();
-            var srcInfo = new FileInfo(srcFullPath);
-            System.IO.File.SetLastWriteTimeUtc(dst, srcInfo.LastWriteTimeUtc);
-            AppLog.Info($"[WATCH] Обновлён в бэкапе: {dst}");
-            return true;
-        }
-        catch (OperationCanceledException)
-        {
-            AppLog.Info($"[WATCH] Копирование отменено (извлечение флешки): {srcFullPath}");
-            return false;
-        }
-        catch (Exception ex)
-        {
-            AppLog.Error(ex, $"[WATCH] Ошибка копирования {srcFullPath}");
-            return false;
-        }
-    }
-
-    /// <summary>Файл удалён на флешке → удалить его в бэкапе (режим «зеркало»).</summary>
-    public void DeleteFromBackup(string srcFullPath, string sourceDir, string targetDir)
-    {
-        if (!_mirror) return;
-        try
-        {
-            var rel = Path.GetRelativePath(sourceDir, srcFullPath);
-            var dst = Path.Combine(targetDir, rel);
-            if (System.IO.File.Exists(dst))
-            {
-                System.IO.File.Delete(dst);
-                AppLog.Info($"[WATCH][MIRROR] Удалён с флешки → удалён в бэкапе: {dst}");
-            }
-        }
-        catch (Exception ex) { AppLog.Error(ex, $"[WATCH] Не удалось удалить {srcFullPath}"); }
-    }
-
-    // =====================================================================
-    //  ВСПОМОГАТЕЛЬНОЕ
-    // =====================================================================
-
-    /// <summary>
-    /// Метаданные всех файлов (рекурсивно). Не открывает содержимое файлов.
-    /// </summary>
+    /// <summary>Метаданные всех файлов (рекурсивно). Не открывает содержимое файлов.</summary>
     /// <param name="inaccessibleDirs">
     /// Каталоги, которые не удалось перечислить (нет доступа). Их файлы отсутствуют
     /// в снимке не потому, что удалены, а потому что не прочитаны. Зеркальная чистка
-    /// обязана их не трогать (BUG-02), иначе бэкап теряет данные.
+    /// обязана их не трогать, иначе бэкап теряет данные.
     /// </param>
     private List<FileMeta> SnapshotFiles(
         string root, IProgress<SyncProgress>? progress, out HashSet<string> inaccessibleDirs)
@@ -450,13 +74,10 @@ public sealed class FileSyncService
 
         var opts = new EnumerationOptions
         {
-            // Обход ручной: нужно знать, какие каталоги не открылись. Поэтому
-            // IgnoreInaccessible=false — исключение ловим на уровне каталога.
+            // Обход ручной: нужно знать, какие каталоги не открылись.
             RecurseSubdirectories = false,
             IgnoreInaccessible = false,
-            AttributesToSkip = _skipHiddenSystem
-                ? FileAttributes.Hidden | FileAttributes.System | FileAttributes.ReparsePoint
-                : FileAttributes.ReparsePoint,
+            AttributesToSkip = FileAttributes.Hidden | FileAttributes.System | FileAttributes.ReparsePoint,
         };
 
         var result = new List<FileMeta>();
@@ -486,8 +107,7 @@ public sealed class FileSyncService
                     }
                     catch
                     {
-                        // Файл мог исчезнуть/быть недоступен во время обхода — сохраняем путь,
-                        // размер впоследствии будет вычислен при попытке копирования.
+                        // Файл исчез/недоступен во время обхода: размер вычислится при копировании.
                         result.Add(new FileMeta(path, 0, DateTime.MinValue));
                     }
 
@@ -501,8 +121,8 @@ public sealed class FileSyncService
             }
             catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException)
             {
-                // Корень не читается вовсе — это не «пустая флешка»: зеркальная чистка
-                // по пустому снимку снесла бы весь бэкап. Пробрасываем наверх.
+                // Корень не читается вовсе — это не «пустая флешка»: чистка по пустому
+                // снимку снесла бы весь бэкап. Пробрасываем наверх.
                 if (string.Equals(dir, root, StringComparison.OrdinalIgnoreCase))
                     throw;
 
@@ -511,17 +131,239 @@ public sealed class FileSyncService
             }
         }
 
-        // Флешку вынули во время обхода: DirectoryNotFoundException по подкаталогам
-        // выше не ловится намеренно (IOException летит в SyncAllAsync как ошибка),
-        // но корень всё равно проверяем — пустой снимок вынутой флешки смертелен для зеркала.
+        // Флешку вынули во время обхода — пустой снимок смертелен для зеркала.
         if (!Directory.Exists(root))
             throw new DirectoryNotFoundException("Источник недоступен во время сканирования: " + root);
 
         if (progress is not null && count > 0)
-        {
             progress.Report(new SyncProgress('\0', count, count, 0, 0, 0, 0, root, SyncPhase.Scanning));
-        }
+
         return result;
+    }
+
+    /// <summary>Зеркалирует <paramref name="sourceDir"/> (флешка) → <paramref name="targetDir"/> (бэкап).</summary>
+    public async Task<SyncResult> SyncAllAsync(
+        string sourceDir, string targetDir,
+        IProgress<SyncProgress>? progress, CancellationToken ct)
+    {
+        if (!Directory.Exists(sourceDir))
+            return new SyncResult(0, 0, 0, 0, "Флешка отключена");
+
+        List<FileMeta> sourceFiles;
+        HashSet<string> inaccessibleDirs;
+        long totalBytes = 0;
+        try
+        {
+            sourceFiles = SnapshotFiles(sourceDir, progress, out inaccessibleDirs);
+            foreach (var f in sourceFiles) totalBytes += f.Size;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, $"Не удалось просканировать {sourceDir}");
+            return new SyncResult(0, 0, 0, 0, $"Ошибка сканирования: {ex.Message}");
+        }
+
+        var sw = Stopwatch.StartNew();
+        int copied = 0, skipped = 0;
+        long bytesCopied = 0;
+
+        var targetIndex = BuildTargetIndex(targetDir);
+        progress?.Report(new SyncProgress('\0', 0, sourceFiles.Count, 0, 0, 0, totalBytes, "", SyncPhase.Scanning));
+
+        // Предварительное создание целевых каталогов.
+        var createdDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var fm in sourceFiles)
+        {
+            var dstDir = Path.GetDirectoryName(Path.Combine(targetDir, Path.GetRelativePath(sourceDir, fm.Path)))!;
+            if (createdDirs.Contains(dstDir)) continue;
+            try { Directory.CreateDirectory(dstDir); createdDirs.Add(dstDir); }
+            catch { /* будет повторная попытка перед конкретным файлом */ }
+        }
+
+        var progressSw = Stopwatch.StartNew();
+        int lastPercent = 0;
+
+        for (int i = 0; i < sourceFiles.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            // Флешку вынули прямо во время копирования: не перебираем оставшиеся файлы.
+            if ((i & 0x7F) == 0 && !Directory.Exists(sourceDir))
+            {
+                AppLog.Warn("Флешка отключена во время синхронизации — копирование остановлено");
+                return new SyncResult(copied, 0, skipped, bytesCopied, "Флешка отключена");
+            }
+
+            var srcMeta = sourceFiles[i];
+            var srcPath = srcMeta.Path;
+            try
+            {
+                var rel = Path.GetRelativePath(sourceDir, srcPath);
+                var dstPath = Path.Combine(targetDir, rel);
+                var srcKey = new FileKey(srcMeta.Size, srcMeta.LastWriteUtc);
+
+                bool needsCopy = !targetIndex.TryGetValue(rel, out var dstKey) || dstKey != srcKey;
+                if (!needsCopy)
+                {
+                    skipped++;
+                }
+                else
+                {
+                    var dstDir = Path.GetDirectoryName(dstPath)!;
+                    if (!createdDirs.Contains(dstDir))
+                    {
+                        Directory.CreateDirectory(dstDir);
+                        createdDirs.Add(dstDir);
+                    }
+
+                    await CopyChunkedAsync(srcPath, dstPath, ct);
+
+                    // .tmp → Move сохраняет время записи .tmp: возвращаем дату источника,
+                    // иначе следующий прогон снова сочтёт файл новым.
+                    System.IO.File.SetLastWriteTimeUtc(dstPath, srcMeta.LastWriteUtc);
+
+                    copied++;
+                    bytesCopied += srcMeta.Size;
+                    targetIndex[rel] = srcKey;
+                }
+
+                int percent = totalBytes > 0
+                    ? (int)(bytesCopied * 100L / totalBytes)
+                    : (i == sourceFiles.Count - 1 ? 100 : 0);
+
+                if (progress is not null &&
+                    (percent != lastPercent || progressSw.ElapsedMilliseconds >= 100))
+                {
+                    progress.Report(new SyncProgress('\0', i + 1, sourceFiles.Count,
+                        copied, skipped, bytesCopied, totalBytes, srcPath, SyncPhase.Copying));
+                    lastPercent = percent;
+                    progressSw.Restart();
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                AppLog.Error(ex, $"Не удалось скопировать {srcPath}");
+                if (!Directory.Exists(sourceDir))
+                {
+                    AppLog.Warn("Флешка отключена во время синхронизации — копирование остановлено");
+                    return new SyncResult(copied, 0, skipped, bytesCopied, "Флешка отключена");
+                }
+            }
+        }
+
+        int deleted = MirrorPrune(sourceDir, targetDir, sourceFiles, inaccessibleDirs, targetIndex, copied, skipped, progress, ct);
+
+        progress?.Report(new SyncProgress('\0', sourceFiles.Count, sourceFiles.Count,
+            copied, skipped, bytesCopied, totalBytes, "", SyncPhase.Completed));
+
+        AppLog.Info(
+            $"SyncAll {sourceDir} → {targetDir}: копий {copied}, пропущено {skipped}, " +
+            $"удалено {deleted}, {bytesCopied / 1048576.0:F1} МБ, {sw.Elapsed.TotalSeconds:F1} c");
+
+        return new SyncResult(copied, deleted, skipped, bytesCopied, null);
+    }
+
+    /// <summary>Удаляет из бэкапа файлы, которых нет на флешке («зеркало»).</summary>
+    private static int MirrorPrune(
+        string sourceDir, string targetDir, List<FileMeta> sourceFiles, HashSet<string> inaccessibleDirs,
+        Dictionary<string, FileKey> targetIndex, int copied, int skipped,
+        IProgress<SyncProgress>? progress, CancellationToken ct)
+    {
+        var fullTargetDir = Path.GetFullPath(targetDir);
+        var root = Path.GetPathRoot(fullTargetDir);
+        if (string.IsNullOrWhiteSpace(root) ||
+            string.Equals(fullTargetDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                          root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                          StringComparison.OrdinalIgnoreCase))
+        {
+            AppLog.Error(null, "SEC B-04: mirror pruning отменён — targetDir является корнем");
+            return 0;
+        }
+
+        var expectedOnSource = new HashSet<string>(
+            sourceFiles.Select(s => Path.GetRelativePath(sourceDir, s.Path)),
+            StringComparer.OrdinalIgnoreCase);
+
+        // Файлы под каталогами, недоступными при сканировании, отсутствуют в снимке
+        // не из-за удаления — из бэкапа их удалять нельзя.
+        var protectedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var d in inaccessibleDirs)
+        {
+            try { protectedDirs.Add(Path.GetRelativePath(sourceDir, d)); }
+            catch { /* вне sourceDir — не наш случай */ }
+        }
+
+        var sep = Path.DirectorySeparatorChar;
+        var prefix = fullTargetDir.TrimEnd(sep) + sep;
+        var toDelete = new List<string>();
+        int protectedSkipped = 0;
+
+        foreach (var rel in targetIndex.Keys)
+        {
+            if (expectedOnSource.Contains(rel)) continue;
+            if (IsUnderAnyDir(rel, protectedDirs)) { protectedSkipped++; continue; }
+
+            string dst;
+            try { dst = Path.GetFullPath(Path.Combine(fullTargetDir, rel)); }
+            catch { AppLog.Error(null, "SEC B-04: некорректный путь: " + rel); continue; }
+
+            if (!dst.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                AppLog.Error(null, "SEC B-04: отказ удаления вне targetDir: " + dst);
+                continue;
+            }
+            if (PathSafety.ContainsReparsePoint(dst))
+            {
+                AppLog.Error(null, "SEC B-04: отказ удаления — reparse point: " + dst);
+                continue;
+            }
+
+            toDelete.Add(rel);
+        }
+
+        if (protectedSkipped > 0)
+            AppLog.Warn($"[MIRROR] Не удалено файлов: {protectedSkipped} — их каталог был недоступен при сканировании");
+
+        int totalToPrune = toDelete.Count;
+        progress?.Report(new SyncProgress('\0', 0, totalToPrune, copied, skipped, 0, totalToPrune, "", SyncPhase.Pruning));
+
+        int pruned = 0;
+        var pruneSw = Stopwatch.StartNew();
+        var examples = new List<string>(3);
+
+        foreach (var rel in toDelete)
+        {
+            ct.ThrowIfCancellationRequested();
+            string dst = Path.GetFullPath(Path.Combine(fullTargetDir, rel));
+
+            try
+            {
+                System.IO.File.Delete(dst);
+                pruned++;
+                targetIndex.Remove(rel);
+                if (examples.Count < 3) examples.Add(dst);
+
+                if (progress is not null && (pruned % 128 == 0 || pruneSw.ElapsedMilliseconds >= 150))
+                {
+                    progress.Report(new SyncProgress('\0', pruned, totalToPrune, copied, skipped, pruned, totalToPrune, dst, SyncPhase.Pruning));
+                    pruneSw.Restart();
+                }
+            }
+            catch (Exception ex) { AppLog.Error(ex, $"Не удалось удалить {dst}"); }
+        }
+
+        if (pruned > 0)
+        {
+            var suffix = examples.Count > 0 ? "; например: " + string.Join("; ", examples) : "";
+            AppLog.Info($"[MIRROR] Удалено файлов: {pruned}{suffix}");
+        }
+
+        if (progress is not null && pruned > 0 && pruned != totalToPrune)
+            progress.Report(new SyncProgress('\0', pruned, totalToPrune, copied, skipped, pruned, totalToPrune, "", SyncPhase.Pruning));
+
+        CleanupEmptyDirs(fullTargetDir);
+        return pruned;
     }
 
     /// <summary>Относительный путь лежит внутри одного из каталогов (или совпадает).</summary>
@@ -538,24 +380,10 @@ public sealed class FileSyncService
     }
 
     /// <summary>Индекс приёмной папки: относительный путь → (размер, дата UTC).</summary>
-    private Dictionary<string, FileKey> BuildTargetIndex(string targetDir)
+    private static Dictionary<string, FileKey> BuildTargetIndex(string targetDir)
     {
         var idx = new Dictionary<string, FileKey>(StringComparer.OrdinalIgnoreCase);
         if (!Directory.Exists(targetDir)) return idx;
-
-        if (_useTargetIndexCache)
-        {
-            var cached = TryReadTargetIndexCache(targetDir);
-            if (cached is not null)
-            {
-                foreach (var e in cached.Entries)
-                {
-                    if (string.IsNullOrWhiteSpace(e.Path)) continue;
-                    idx[e.Path] = new FileKey(e.Size, new DateTime(e.LastWriteUtcTicks, DateTimeKind.Utc));
-                }
-                return idx;
-            }
-        }
 
         var opts = new EnumerationOptions
         {
@@ -565,176 +393,45 @@ public sealed class FileSyncService
         };
         foreach (var fi in new DirectoryInfo(targetDir).EnumerateFiles("*", opts))
         {
-            try
-            {
-                idx[Path.GetRelativePath(targetDir, fi.FullName)] = new FileKey(fi.Length, fi.LastWriteTimeUtc);
-            }
+            try { idx[Path.GetRelativePath(targetDir, fi.FullName)] = new FileKey(fi.Length, fi.LastWriteTimeUtc); }
             catch { /* файл мог исчезнуть во время обхода */ }
         }
         return idx;
     }
 
-    /// <summary>
-    /// Чанковое 256-КБ копирование с ArrayPool:
-    ///   • GC почти не аллокирует (буфер переиспользуется);
-    ///   • SequentialScan помогает планировщику ОС читать вперёд;
-    ///   • запись во временный .tmp + атомарный Move = бэкап всегда согласован.
-    /// Reserved temp-файлы «недокопированного» вида невозможны.
-    /// </summary>
-    private sealed class TargetIndexCache
+    /// <summary>Чанковое копирование с ArrayPool; запись во временный .tmp + атомарный Move.</summary>
+    private static async Task CopyChunkedAsync(string src, string dst, CancellationToken ct)
     {
-        public int Version { get; set; } = 2;
-        public long RootLastWriteUtcTicks { get; set; }
-
-        /// <summary>Относительный путь каталога → его LastWriteTimeUtc.Ticks.</summary>
-        public Dictionary<string, long> DirLastWriteUtcTicks { get; set; } = new(StringComparer.OrdinalIgnoreCase);
-
-        public List<TargetIndexEntry> Entries { get; set; } = new();
-    }
-
-    private sealed class TargetIndexEntry
-    {
-        public string Path { get; set; } = string.Empty;
-        public long Size { get; set; }
-        public long LastWriteUtcTicks { get; set; }
-    }
-
-    private static string GetTargetIndexCachePath(string targetDir)
-    {
-        using var sha = System.Security.Cryptography.SHA256.Create();
-        var hash = Convert.ToHexString(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(targetDir)));
-        return Path.Combine(SettingsStore.Dir, "target-index", hash.Substring(0, 24) + ".json");
-    }
-
-    private static TargetIndexCache? TryReadTargetIndexCache(string targetDir)
-    {
-        var path = GetTargetIndexCachePath(targetDir);
-        if (!File.Exists(path) || !Directory.Exists(targetDir)) return null;
-        try
-        {
-            var json = File.ReadAllText(path);
-            var cache = System.Text.Json.JsonSerializer.Deserialize<TargetIndexCache>(
-                json, new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-            if (cache is null || cache.Version != 2) return null;
-
-            var currentRoot = Directory.GetLastWriteTimeUtc(targetDir).Ticks;
-            if (cache.RootLastWriteUtcTicks != currentRoot) return null;
-
-            // Проверяем mtime ВСЕХ каталогов приёмника: изменение файла меняет
-            // время его папки, поэтому устаревший индекс не будет использован.
-            var currentDirs = SnapshotDirTimes(targetDir);
-            if (currentDirs.Count != cache.DirLastWriteUtcTicks.Count) return null;
-            foreach (var kv in currentDirs)
-            {
-                if (!cache.DirLastWriteUtcTicks.TryGetValue(kv.Key, out var cachedTicks) ||
-                    cachedTicks != kv.Value)
-                {
-                    return null;
-                }
-            }
-
-            return cache;
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    /// <summary>Относительный путь каталога ("" — корень) → LastWriteTimeUtc.Ticks.</summary>
-    private static Dictionary<string, long> SnapshotDirTimes(string root)
-    {
-        var result = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase)
-        {
-            [""] = Directory.GetLastWriteTimeUtc(root).Ticks,
-        };
-
-        var opts = new EnumerationOptions
-        {
-            RecurseSubdirectories = true,
-            IgnoreInaccessible = true,
-            AttributesToSkip = FileAttributes.ReparsePoint,
-        };
-
-        foreach (var dir in new DirectoryInfo(root).EnumerateDirectories("*", opts))
-        {
-            try { result[Path.GetRelativePath(root, dir.FullName)] = dir.LastWriteTimeUtc.Ticks; }
-            catch { /* каталог исчез во время обхода */ }
-        }
-        return result;
-    }
-
-    private static void SaveTargetIndexCache(string targetDir, Dictionary<string, FileKey> index)
-    {
-        if (!Directory.Exists(targetDir)) return;
-        try
-        {
-            var cache = new TargetIndexCache
-            {
-                RootLastWriteUtcTicks = Directory.GetLastWriteTimeUtc(targetDir).Ticks,
-                DirLastWriteUtcTicks = SnapshotDirTimes(targetDir),
-                Entries = index.Select(kv => new TargetIndexEntry
-                {
-                    Path = kv.Key,
-                    Size = kv.Value.Size,
-                    LastWriteUtcTicks = kv.Value.LastWriteUtc.Ticks,
-                }).ToList(),
-            };
-
-            var dir = Path.GetDirectoryName(GetTargetIndexCachePath(targetDir))!;
-            Directory.CreateDirectory(dir);
-            var final = GetTargetIndexCachePath(targetDir);
-            var tmp = final + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            File.WriteAllText(tmp, System.Text.Json.JsonSerializer.Serialize(cache, new System.Text.Json.JsonSerializerOptions { WriteIndented = false }));
-            File.Move(tmp, final, overwrite: true);
-        }
-        catch
-        {
-            // Кэш не критичен: при неудаче просто будет полное сканирование.
-        }
-    }
-
-    private async Task CopyChunkedAsync(string src, string dst, CancellationToken ct)
-    {
-        // Уникальный tmp: параллельные копии одного файла (live-watch + полный прогон)
-        // не должны писать в один и тот же временный файл.
         var tmp = dst + "." + Guid.NewGuid().ToString("N") + ".tmp";
 
         try
         {
             await using (var srcStream = new FileStream(
                 src, FileMode.Open, FileAccess.Read,
-                FileShare.Read | FileShare.Write | FileShare.Delete, // не блокируем открытие пользователем
-                _bufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                FileShare.Read | FileShare.Write | FileShare.Delete,
+                BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
-                // Буфер не больше самого файла: не арендуем 4 МБ под файл в 10 КБ.
+                // Буфер не больше самого файла: не арендуем мегабайт под файл в 10 КБ.
                 int chunk = (int)Math.Clamp(
-                    Math.Min(_bufferSize, Math.Max(64 * 1024, srcStream.Length)),
-                    64 * 1024, _bufferSize);
+                    Math.Min(BufferSize, Math.Max(64 * 1024, srcStream.Length)),
+                    64 * 1024, BufferSize);
 
                 await using var dstStream = new FileStream(
                     tmp, FileMode.Create, FileAccess.Write, FileShare.None,
                     chunk, FileOptions.Asynchronous);
-                {
-                    var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(chunk);
-                    try
-                    {
-                        int read;
-                        while ((read = await srcStream.ReadAsync(buffer.AsMemory(0, chunk), ct)) > 0)
-                        {
-                            await dstStream.WriteAsync(buffer.AsMemory(0, read), ct);
-                        }
 
-                        // Flush(true) сбрасывает и managed-буфер, поэтому при включённом
-                        // flushAfterFile отдельный FlushAsync не нужен (раньше была двойная работа).
-                        if (_flushAfterFile) dstStream.Flush(true);
-                        else await dstStream.FlushAsync(ct);
-                    }
-                    finally { System.Buffers.ArrayPool<byte>.Shared.Return(buffer); }
+                var buffer = ArrayPool<byte>.Shared.Rent(chunk);
+                try
+                {
+                    int read;
+                    while ((read = await srcStream.ReadAsync(buffer.AsMemory(0, chunk), ct)) > 0)
+                        await dstStream.WriteAsync(buffer.AsMemory(0, read), ct);
+
+                    await dstStream.FlushAsync(ct);
                 }
+                finally { ArrayPool<byte>.Shared.Return(buffer); }
             }
 
-            // Атомарная замена цели (overwrite: true) — без окна «файла нет».
             System.IO.File.Move(tmp, dst, overwrite: true);
         }
         catch
@@ -745,7 +442,7 @@ public sealed class FileSyncService
         }
     }
 
-    /// <summary>Однопроходная чистка опустевших папок (глубина обхода задана циклом).</summary>
+    /// <summary>Удаление опустевших папок после зеркальной чистки (с глубоких к корню).</summary>
     private static void CleanupEmptyDirs(string root)
     {
         try
@@ -757,7 +454,7 @@ public sealed class FileSyncService
                 AttributesToSkip = FileAttributes.ReparsePoint,
             };
             foreach (var dir in Directory.EnumerateDirectories(root, "*", opts)
-                                           .OrderByDescending(d => d.Length)) // с глубоких к корню
+                                           .OrderByDescending(d => d.Length))
             {
                 if (!Directory.EnumerateFileSystemEntries(dir).Any())
                 {
@@ -767,4 +464,6 @@ public sealed class FileSyncService
         }
         catch { /* не критично */ }
     }
+
+    private readonly record struct FileMeta(string Path, long Size, DateTime LastWriteUtc);
 }

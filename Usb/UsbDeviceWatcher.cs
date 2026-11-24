@@ -296,8 +296,7 @@ public sealed class UsbDeviceWatcher
         {
             try
             {
-                var info = QueryDrive(letter, retry: 3, delayMs: 200,
-                    includeFixed: SettingsStore.Current.IncludeUsbFixedDrives);
+                var info = QueryDrive(letter, retry: 3, delayMs: 200);
                 if (info is not null)
                 {
                     AppLog.Info($"WM_DEVICECHANGE: ARRIVAL {letter}: «{info!.Value.VolumeLabel}» serial={info.Value.Serial}");
@@ -322,15 +321,15 @@ public sealed class UsbDeviceWatcher
     /// <summary>
     /// Подходит ли том для резервирования:
     ///   • DRIVE_REMOVABLE — всегда (обычные флешки);
-    ///   • DRIVE_FIXED — только при includeFixed и если шина USB
-    ///     (внешние HDD/SSD в USB-корпусе Windows видит как фиксированные).
+    ///   • DRIVE_FIXED — только если шина USB (внешние HDD/SSD в USB-корпусе
+    ///     Windows видит как фиксированные).
     /// </summary>
-    public static bool IsEligibleDrive(char letter, bool includeFixed)
+    public static bool IsEligibleDrive(char letter)
     {
         var root = $@"{letter}:\";
         uint type = GetDriveTypeW(root);
         if (type == 2) return true;                 // DRIVE_REMOVABLE
-        if (type == 3 && includeFixed) return IsUsbBus(letter); // DRIVE_FIXED
+        if (type == 3) return IsUsbBus(letter);     // DRIVE_FIXED
         return false;
     }
 
@@ -383,12 +382,12 @@ public sealed class UsbDeviceWatcher
     }
 
     public static (string VolumeLabel, string Serial)? QueryDrive(
-        char letter, int retry, int delayMs, bool includeFixed = false)
+        char letter, int retry, int delayMs)
     {
         var root = $@"{letter}:\";
         for (int attempt = 0; attempt < retry; attempt++)
         {
-            if (IsEligibleDrive(letter, includeFixed))
+            if (IsEligibleDrive(letter))
             {
                 var label = new StringBuilder(261);
                 var fs = new StringBuilder(64);

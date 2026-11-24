@@ -63,30 +63,7 @@ public sealed class DriveProfile
         }
     }
 
-    [JsonPropertyName("settingsTested")]
-    public bool SettingsTested { get; set; }
-
-    [JsonPropertyName("mirrorModeOverride")]
-    public bool? MirrorModeOverride { get; set; }
-
-    [JsonPropertyName("verifyByCrcOverride")]
-    public bool? VerifyByCrcOverride { get; set; }
-
-    [JsonPropertyName("skipHiddenSystemOverride")]
-    public bool? SkipHiddenSystemOverride { get; set; }
-
-    [JsonPropertyName("liveWatchOverride")]
-    public bool? LiveWatchOverride { get; set; }
-
-    [JsonPropertyName("bufferSizeKbOverride")]
-    public int? BufferSizeKbOverride { get; set; }
-
-    [JsonPropertyName("flushAfterFileOverride")]
-    public bool? FlushAfterFileOverride { get; set; }
-
-    [JsonPropertyName("fastSmallFileCopyOverride")]
-    public bool? FastSmallFileCopyOverride { get; set; }
-
+    /// <summary>Персональная папка хранения (null — глобальная).</summary>
     [JsonPropertyName("baseBackupPathOverride")]
     public string? BaseBackupPathOverride { get; set; }
 
@@ -103,18 +80,6 @@ public sealed class AppSettings
     [JsonPropertyName("baseBackupPath")]
     public string BaseBackupPath { get; set; } = "";
 
-    /// <summary>Режим «зеркало»: файлы, удалённые на флешке, удаляются и в бэкапе.</summary>
-    [JsonPropertyName("mirrorMode")]
-    public bool MirrorMode { get; set; } = true;
-
-    /// <summary>
-    /// Способ сравнения:
-    ///     false: «Размер + Дата изменения» (не читает содержимое — быстро, чуть менее надёжно)
-    ///   true : CRC32 поверх Size+Date (читает оба файла чанками — медленнее, но 100% точно)
-    /// </summary>
-    [JsonPropertyName("verifyByCrc")]
-    public bool VerifyByCrc { get; set; } = false;
-
     /// <summary>Автозапуск вместе с Windows (HKCU\...\Run — не требует прав администратора).</summary>
     [JsonPropertyName("runAtStartup")]
     public bool RunAtStartup { get; set; } = false;
@@ -122,69 +87,6 @@ public sealed class AppSettings
     /// <summary>Скрыть окно на старте при автозапуске.</summary>
     [JsonPropertyName("startMinimized")]
     public bool StartMinimized { get; set; } = false;
-
-    /// <summary>Инкрементальное копирование — игнорировать системные/скрытые файлы флешки.</summary>
-    [JsonPropertyName("defaultBufferSizeKb")]
-    public int DefaultBufferSizeKb { get; set; } = 4096;
-
-    /// <summary>
-    /// Физический сброс (fsync) после каждого файла. По умолчанию выключен:
-    /// на USB-флешках это десятки миллисекунд на файл, т.е. минуты на тысячах
-    /// мелких файлов. Копия и так атомарна (.tmp → Move), поэтому включение
-    /// нужно только для максимальной устойчивости к выдёргиванию флешки.
-    /// </summary>
-    [JsonPropertyName("defaultFlushAfterFile")]
-    public bool DefaultFlushAfterFile { get; set; } = false;
-
-    /// <summary>
-    /// Если включено — мелкие файлы копируются прямо в целевой файл (быстрее,
-    /// но менее безопасно при резком извлечении флешки). Если выключено —
-    /// всегда используется атомарный путь .tmp → Move.
-    /// </summary>
-    [JsonPropertyName("defaultFastCopy")]
-    public bool DefaultFastCopy { get; set; } = false;
-
-    [JsonPropertyName("skipHiddenSystem")]
-    public bool SkipHiddenSystem { get; set; } = true;
-
-    [JsonPropertyName("autoTestNewDrives")]
-    public bool AutoTestNewDrives { get; set; } = true;
-
-    [JsonPropertyName("defaultEnabled")]
-    public bool DefaultEnabled { get; set; } = false;
-
-    /// <summary>
-    /// Мгновенная синхронизация изменений (FileSystemWatcher): если true —
-    /// добавление/удаление/изменение файла на флешке сразу запускает копирование.
-    /// По умолчанию ВЫКЛЮЧЕНО: полный прогон только при подключении флешки или
-    /// по кнопке «Синхронизировать» (пользователь просит предсказуемость).
-    /// </summary>
-    [JsonPropertyName("liveWatch")]
-    public bool LiveWatch { get; set; } = false;
-
-    /// <summary>
-    /// Обработка Windows-запроса безопасного извлечения тома (DBT_DEVICEQUERYREMOVE):
-    /// синхронное освобождение хэндлов и cancel sync/watcher. false = полный no-op, только TRUE.
-    /// </summary>
-    [JsonPropertyName("handleSafeRemoval")]
-    public bool HandleSafeRemoval { get; set; } = true;
-
-    [JsonPropertyName("pollingIntervalSeconds")]
-    public int PollingIntervalSeconds { get; set; } = 30;
-
-    [JsonPropertyName("usePollingInIdle")]
-    public bool UsePollingInIdle { get; set; } = true;
-
-    [JsonPropertyName("forceLegacyWatcher")]
-    public bool ForceLegacyWatcher { get; set; } = false;
-
-    /// <summary>
-    /// Учитывать USB-диски, которые Windows определяет как DRIVE_FIXED
-    /// (внешние HDD/SSD в USB-корпусе). По умолчанию выключено: обрабатываются
-    /// только съёмные носители.
-    /// </summary>
-    [JsonPropertyName("includeUsbFixedDrives")]
-    public bool IncludeUsbFixedDrives { get; set; } = false;
 
     /// <summary>Список известных флешек.</summary>
     [JsonPropertyName("drives")]
@@ -374,7 +276,7 @@ public static class SettingsStore
                     Serial = serial,
                     Label = string.IsNullOrWhiteSpace(label) ? "USB-накопитель" : label,
                     FolderName = BuildFolderName(label, serial),
-                    Enabled = Current.DefaultEnabled,
+                    Enabled = false,
                 };
                 Current.Drives.Add(found);
                 Save();

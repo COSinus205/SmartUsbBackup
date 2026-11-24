@@ -5,7 +5,7 @@
 ![.NET 8](https://img.shields.io/badge/.NET-8-512BD4)
 ![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D4)
 
-Современное приложение для зеркального резервного копирования USB-флешек. В режиме ожидания приложение не держит постоянных дескрипторов на флешке; изменения отслеживаются лёгким polling с настраиваемым интервалом (по умолчанию 30 секунд), что обеспечивает корректную работу «Безопасного извлечения» в Windows.
+Современное приложение для зеркального резервного копирования USB-флешек. В простое приложение не держит ни дескрипторов на флешке, ни фоновых watcher'ов: копирование запускается при подключении флешки или по кнопке, поэтому «Безопасное извлечение» в Windows работает без «Устройство занято».
 
 > **Версия 4.3.2** — исправления и небольшие улучшения: безопасная проверка путей хранения (включая персональные папки профилей), корректное сравнение версий при обновлении, обязательный SHA-256 для автообновления, поддержка внешних USB HDD/SSD, перенос существующих копий при смене папки и более информативный деинсталлятор. Формат `settings.json` совместим с 4.3.1.
 
@@ -22,10 +22,10 @@
 ## Основные возможности
 
 - Отслеживание подключения/отключения USB без опроса (событийная модель).
-- Зеркальное копирование с проверкой CRC и режимом «залить как есть».
-- Настраиваемые профили для каждой флешки: зеркало, CRC32, автозапуск, обновление сразу при подключении.
-- Персональные вкладки настроек для каждой флешки.
-- Поддержка обычных флешек и (опционально) внешних USB HDD/SSD.
+- Зеркальное копирование: то, чего нет на флешке, удаляется из бэкапа. Сравнение по размеру и дате изменения.
+- Профили флешек по серийному номеру: включение резервирования и персональная папка хранения.
+- Автоматическое копирование при подключении включённой флешки и ручная синхронизация по кнопке.
+- Поддержка обычных флешек и внешних USB HDD/SSD.
 - Адаптивный Fluent-интерфейс с вкладками, тёмной/светлой темой и Mica.
 - Работа в фоне и из системного трея, автопроверка обновлений.
 
@@ -59,29 +59,30 @@ dotnet build -c Release
 
 ## Безопасное извлечение (safe-remove)
 
-- `FileSystemWatcher` не создаётся в конструкторе сессии и не удерживается на флешке постоянно. Watcher открывается только на время активной синхронизации и закрывается после её завершения.
-- В простое отслеживание изменений идёт через лёгкий **polling**: периодический обход корня и папок первого уровня с расчётом подписи (количество элементов, `LastWriteTime`, размер). Хэндлы на том не удерживаются, поэтому «Безопасное извлечение» в Windows в типичном сценарии «вставил — извлёк» проходит без «Устройство занято».
-- При получении `DBT_DEVICEQUERYREMOVE` / `DBT_DEVICEQUERYREMOVEFAILED` / `DBT_DEVICEQUERYREMOVEPENDING` приложение останавливает синхронизацию и освобождает хэндлы в пределах таймаута 2000 мс (`BROADCAST_QUERY_DENY` при превышении).
-- `ConnectedSession` идемпотентен при повторном `Dispose`; `ConnectedSession.FileWatcher` может быть `null` (watcher создаётся лениво). `RunDriveSettingsTest` принимает session-scoped `CancellationToken`, отменяемый при `BeginDetachForSafeRemoval`.
+- `FileSystemWatcher` не используется: приложение не следит за изменениями на уже вставленной флешке. Копирование запускается при подключении включённой флешки и по кнопке «Синхронизировать».
+- В простое на томе нет открытых файлов и каталогов, поэтому «Безопасное извлечение» в Windows проходит без «Устройство занято».
+- При получении `DBT_DEVICEQUERYREMOVE` приложение отменяет активное копирование и ждёт завершения задачи (таймаут 1 секунда); при превышении возвращается `BROADCAST_QUERY_DENY`, то есть извлечение временно запрещается.
+- `ConnectedSession` идемпотентен при повторном `Dispose`.
 
 Если Windows всё равно показывает «Устройство занято»:
 
 - Откройте Resource Monitor (resmon) → вкладка CPU → «Связанные дескрипторы», найдите процессы, держащие файлы на букве диска флешки, и закройте их.
 - Либо используйте `handle.exe -a -u D:` из Sysinternals, чтобы найти и закрыть хэндлы.
-- Проверьте, что не включена настройка `ForceLegacyWatcher=true` (она только для отладки).
 
 ## Настройки
 
-Новые поля `AppSettings` в `settings.json`. Обратная совместимость сохранена — старые файлы десериализуются с дефолтами:
+Глобальные настройки `AppSettings` в `settings.json` (старые файлы читаются совместимо, неизвестные поля игнорируются):
 
 | Настройка | По умолчанию | Назначение |
 |---|---|---|
-| `HandleSafeRemoval` | `true` | Обработка `DBT_DEVICEQUERYREMOVE`: синхронное освобождение хэндлов и отмена sync/watcher. `false` — полный no-op. |
-| `UsePollingInIdle` | `true` | Включить polling в простое. |
-| `PollingIntervalSeconds` | `30` (мин. `5`) | Интервал polling в секундах. |
-| `ForceLegacyWatcher` | `false` | Только для отладки/возврата старого поведения (постоянный `FileSystemWatcher`). |
+| `BaseBackupPath` | `%LocalAppData%\SmartUsbBackup\Backups` | Папка хранения копий. |
+| `RunAtStartup` | `false` | Запускать приложение с Windows. |
+| `StartMinimized` | `false` | Скрывать окно при автозапуске. |
+| `AutoCheckForUpdates` | `true` | Автопроверка обновлений раз в сутки. |
+| `LastUpdateCheck` | `DateTime.MinValue` | Время последней проверки обновлений. |
+| `Drives` | `[]` | Профили флешек: `Serial`, `Label`, `FolderName`, `Enabled`, `FirstSeen`, `BaseBackupPathOverride`. |
 
-Остальные настройки (зеркало, CRC, live-watch и т.д.) — см. `Core/Settings.cs`.
+Новые флешки добавляются с `Enabled = false`; включить резервирование можно в строке таблицы или на вкладке флешки.
 
 ## Структура проекта
 
@@ -99,16 +100,14 @@ dotnet build -c Release
 | `Core/DriveRow.cs` | Модель строки таблицы флешек (INotifyPropertyChanged). |
 | `Core/Settings.cs` | `AppSettings`/`SettingsStore`, чтение/сохранение `settings.json`. |
 | `Core/UpdateService.cs` | Проверка и скачивание обновлений через GitHub Releases. |
-| `Sync/BackupOrchestrator.cs` | Оркестрация синхронизации (подключение/отключение, sync all/one, wipe). |
-| `Sync/FileSyncService.cs` | Копирование файлов (ArrayPool, `.tmp`, Move, CRC32). |
-| `Sync/Crc32.cs` | Расчёт CRC32. |
+| `Sync/BackupOrchestrator.cs` | Оркестрация синхронизации (подключение/отключение, sync all/one, wipe, safe-remove). |
+| `Sync/FileSyncService.cs` | Зеркальное копирование (ArrayPool, `.tmp`, Move, защита недоступных каталогов). |
 | `Usb/UsbDeviceWatcher.cs` | `WM_DEVICECHANGE` через subclass окна. |
-| `Usb/UsbFileWatcher.cs` | `FileSystemWatcher` для live-watch (создаётся лениво). |
 | `Tray/NativeTrayIcon.cs` | Трей: `Shell_NotifyIcon`, меню, balloon. |
 | `Interop/NativeMethods.cs` | Win32-interop/helper'ы (ShowWindow, SetForegroundWindow и др.). |
 | `Interop/WindowMinSize.cs` | Минимальный размер окна через `WM_GETMINMAXINFO`. |
 | `Properties/AssemblyInfo.cs` | `InternalsVisibleTo("SmartUsbBackup.Tests")`. |
-| `SmartUsbBackup.Tests/` | xUnit-тесты: 92 тестовых случая (47 `[Fact]`, 8 `[Theory]`/45 `[InlineData]`). |
+| `SmartUsbBackup.Tests/` | xUnit-тесты: 82 тестовых случая. |
 | `installer/SmartUsbBackup.iss` | Скрипт Inno Setup (per-user install, деинсталляция, Pascal Script). |
 | `installer/dist/SmartUsbBackup-Setup-4.3.2.exe` | Собранный установщик (релиз). |
 | `CHANGELOG.md` | История изменений. |
@@ -125,7 +124,7 @@ dotnet build -c Release
 dotnet test SmartUsbBackup.Tests/SmartUsbBackup.Tests.csproj
 ```
 
-Все 92 тестовых случая (47 `[Fact]` + 45 `[InlineData]` в 8 `[Theory]`).
+Все 82 тестовых случая.
 
 Сборка без Visual Studio:
 

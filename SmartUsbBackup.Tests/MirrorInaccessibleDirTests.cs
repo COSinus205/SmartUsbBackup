@@ -50,10 +50,7 @@ public sealed class MirrorInaccessibleDirTests
         File.WriteAllText(Path.Combine(src, "open.txt"), "v1");
         File.WriteAllText(Path.Combine(locked, "secret.txt"), "data");
 
-        var svc = new FileSyncService(
-            mirror: true, verifyByCrc: false, skipHiddenSystem: false,
-            bufferSizeKb: 64, flushAfterFile: true, fastSmallFileCopy: false,
-            useTargetIndexCache: false);
+        var svc = new FileSyncService();
 
         await svc.SyncAllAsync(src, dst, null, default);
         var backupSecret = Path.Combine(dst, "locked", "secret.txt");

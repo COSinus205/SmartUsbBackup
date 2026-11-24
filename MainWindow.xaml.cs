@@ -114,29 +114,8 @@ public sealed partial class MainWindow : Window
 
         DriveList.ItemsSource = _rows;
 
-        // Начальные значения чекбоксов (до подписки событий их нельзя ставить — но
-        // события ставят ТУ ЖЕ самое значение, harmless).
-        ChkMirror.IsChecked = SettingsStore.Current.MirrorMode;
-        ChkCrc.IsChecked = SettingsStore.Current.VerifyByCrc;
-        ChkSkipHidden.IsChecked = SettingsStore.Current.SkipHiddenSystem;
-        ChkLiveWatch.IsChecked = SettingsStore.Current.LiveWatch;
+        // Начальные значения чекбоксов.
         ChkAutoUpdate.IsChecked = SettingsStore.Current.AutoCheckForUpdates;
-        ChkAutoTestNewDrives.IsChecked = SettingsStore.Current.AutoTestNewDrives;
-        ChkDefaultEnabled.IsChecked = SettingsStore.Current.DefaultEnabled;
-        ChkIncludeUsbFixed.IsChecked = SettingsStore.Current.IncludeUsbFixedDrives;
-
-        ChkDefaultFlush.IsChecked = SettingsStore.Current.DefaultFlushAfterFile;
-        ChkDefaultFastCopy.IsChecked = SettingsStore.Current.DefaultFastCopy;
-        CmbDefaultBuffer.SelectedIndex = SettingsStore.Current.DefaultBufferSizeKb switch
-        {
-            512 => 0,
-            1024 => 1,
-            2048 => 2,
-            4096 => 3,
-            8192 => 4,
-            16384 => 5,
-            _ => 3,
-        };
         TxtSettingsBackupPath.Text = SettingsStore.Current.BaseBackupPath;
         RefreshStartupCheckboxFromRegistry();
         TxtBackupPath.Text = SettingsStore.Current.BaseBackupPath;
@@ -362,7 +341,6 @@ public sealed partial class MainWindow : Window
             if (result.Error is null)
             {
                 session.LastSuccessfulSyncUtc = DateTime.Now;
-                session.PendingChanges = false;
             }
             // После прогона папка бэкапа точно изменилась — кэш presence устарел.
             _backupPresence.Invalidate(session.Profile.BackupPath);
@@ -401,9 +379,6 @@ public sealed partial class MainWindow : Window
         _usbWatcher.DriveRemoved += l => _dq.TryEnqueue(() => OnDriveRemovedUi(l));
         _usbWatcher.DriveQueryRemove += letter =>
         {
-            if (!SettingsStore.Current.HandleSafeRemoval)
-                return true;
-
             _dq.TryEnqueue(() => SetDriveAttachmentStatus(letter, "Подготовка к извлечению…"));
             bool ok = _orchestrator.HandleDriveQueryRemove(letter);
             _dq.TryEnqueue(() =>
@@ -504,11 +479,10 @@ public sealed partial class MainWindow : Window
                 foreach (var drive in DriveInfo.GetDrives().Where(d => d.IsReady))
                 {
                     char letter = drive.Name[0];
-                    if (!UsbDeviceWatcher.IsEligibleDrive(letter, SettingsStore.Current.IncludeUsbFixedDrives))
+                    if (!UsbDeviceWatcher.IsEligibleDrive(letter))
                         continue;
 
-                    var q = UsbDeviceWatcher.QueryDrive(letter, retry: 1, delayMs: 0,
-                        includeFixed: SettingsStore.Current.IncludeUsbFixedDrives);
+                    var q = UsbDeviceWatcher.QueryDrive(letter, retry: 1, delayMs: 0);
                     if (q is not null)
                         _usbWatcher.RaiseArrived(letter, q.Value.VolumeLabel, q.Value.Serial);
                 }
@@ -711,56 +685,7 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    // ---------- Настройки-чекбоксы ----------
-
-    private void OnMirrorChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.MirrorMode = true);
-    private void OnMirrorUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.MirrorMode = false);
-
-    private void OnCrcChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.VerifyByCrc = true);
-    private void OnCrcUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.VerifyByCrc = false);
-    private void OnLiveChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.LiveWatch = true);
-    private void OnLiveUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.LiveWatch = false);
-    private void OnSkipHiddenChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.SkipHiddenSystem = true);
-    private void OnSkipHiddenUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.SkipHiddenSystem = false);
-    private void OnAutoTestChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.AutoTestNewDrives = true);
-    private void OnAutoTestUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.AutoTestNewDrives = false);
-
-    private void OnIncludeUsbFixedChecked(object sender, RoutedEventArgs e)
-    {
-        SaveSetting(s => s.IncludeUsbFixedDrives = true);
-        EnumerateAlreadyPresentDrives();
-    }
-
-    private void OnIncludeUsbFixedUnchecked(object sender, RoutedEventArgs e)
-    {
-        SaveSetting(s => s.IncludeUsbFixedDrives = false);
-        EnumerateAlreadyPresentDrives();
-    }
-
-    private void OnDefaultBufferChanged(object? sender, SelectionChangedEventArgs e)
-    {
-        if (CmbDefaultBuffer.SelectedIndex < 0) return;
-        int kb = CmbDefaultBuffer.SelectedIndex switch
-        {
-            0 => 512,
-            1 => 1024,
-            2 => 2048,
-            3 => 4096,
-            4 => 8192,
-            5 => 16384,
-            _ => 4096,
-        };
-        SaveSetting(s => s.DefaultBufferSizeKb = kb);
-    }
-
-    private void OnDefaultFlushChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultFlushAfterFile = true);
-    private void OnDefaultFlushUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultFlushAfterFile = false);
-
-    private void OnDefaultFastCopyChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultFastCopy = true);
-    private void OnDefaultFastCopyUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultFastCopy = false);
-
-    private void OnDefaultEnabledChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultEnabled = true);
-    private void OnDefaultEnabledUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.DefaultEnabled = false);
+    // ---------- Настройки ----------
 
     private async void OnSettingsBrowseClicked(object sender, RoutedEventArgs e)
     {
@@ -898,153 +823,6 @@ public sealed partial class MainWindow : Window
             statusText.Text = BuildDriveStatusText(profile);
         };
 
-        var chkMirror = CreateLabeledCheckBox("Зеркало", profile.MirrorModeOverride ?? SettingsStore.Current.MirrorMode);
-        chkMirror.Checked += (_, _) => { profile.MirrorModeOverride = true; SettingsStore.Save(); };
-        chkMirror.Unchecked += (_, _) => { profile.MirrorModeOverride = false; SettingsStore.Save(); };
-
-        var chkCrc = CreateLabeledCheckBox("Проверять CRC32", profile.VerifyByCrcOverride ?? SettingsStore.Current.VerifyByCrc);
-        chkCrc.Checked += (_, _) => { profile.VerifyByCrcOverride = true; SettingsStore.Save(); };
-        chkCrc.Unchecked += (_, _) => { profile.VerifyByCrcOverride = false; SettingsStore.Save(); };
-
-        var chkHidden = CreateLabeledCheckBox("Пропускать скрытые/системные", profile.SkipHiddenSystemOverride ?? SettingsStore.Current.SkipHiddenSystem);
-        chkHidden.Checked += (_, _) => { profile.SkipHiddenSystemOverride = true; SettingsStore.Save(); };
-        chkHidden.Unchecked += (_, _) => { profile.SkipHiddenSystemOverride = false; SettingsStore.Save(); };
-
-        var chkLive = CreateLabeledCheckBox("Обновлять сразу (watch)", profile.LiveWatchOverride ?? SettingsStore.Current.LiveWatch);
-        chkLive.Checked += (_, _) => { profile.LiveWatchOverride = true; SettingsStore.Save(); };
-        chkLive.Unchecked += (_, _) => { profile.LiveWatchOverride = false; SettingsStore.Save(); };
-
-        var bufferLabel = new TextBlock { Text = "Размер буфера, КБ:" };
-        var cmbBuffer = new ComboBox { Width = 120 };
-        cmbBuffer.Items.Add(new ComboBoxItem { Content = "по стандарту" });
-        cmbBuffer.Items.Add(new ComboBoxItem { Content = "512" });
-        cmbBuffer.Items.Add(new ComboBoxItem { Content = "1024" });
-        cmbBuffer.Items.Add(new ComboBoxItem { Content = "2048" });
-        cmbBuffer.Items.Add(new ComboBoxItem { Content = "4096" });
-        cmbBuffer.Items.Add(new ComboBoxItem { Content = "8192" });
-        cmbBuffer.Items.Add(new ComboBoxItem { Content = "16384" });
-        cmbBuffer.SelectedIndex = profile.BufferSizeKbOverride switch
-        {
-            null => 0,
-            512 => 1,
-            1024 => 2,
-            2048 => 3,
-            4096 => 4,
-            8192 => 5,
-            16384 => 6,
-            _ => profile.BufferSizeKbOverride < 768 ? 1 :
-                (profile.BufferSizeKbOverride < 1536 ? 2 :
-                (profile.BufferSizeKbOverride < 3072 ? 3 :
-                (profile.BufferSizeKbOverride < 6144 ? 4 :
-                (profile.BufferSizeKbOverride < 12288 ? 5 : 6)))),
-        };
-        cmbBuffer.SelectionChanged += (_, _) =>
-        {
-            profile.BufferSizeKbOverride = cmbBuffer.SelectedIndex switch
-            {
-                1 => 512,
-                2 => 1024,
-                3 => 2048,
-                4 => 4096,
-                5 => 8192,
-                6 => 16384,
-                _ => null,
-            };
-            SettingsStore.Save();
-        };
-
-        var chkFlush = CreateLabeledCheckBox("Flush после файла (надёжно)", profile.FlushAfterFileOverride ?? SettingsStore.Current.DefaultFlushAfterFile);
-        chkFlush.Checked += (_, _) => { profile.FlushAfterFileOverride = true; SettingsStore.Save(); };
-        chkFlush.Unchecked += (_, _) => { profile.FlushAfterFileOverride = false; SettingsStore.Save(); };
-
-        var chkFastCopy = CreateLabeledCheckBox("Быстрое копирование мелких файлов", profile.FastSmallFileCopyOverride ?? SettingsStore.Current.DefaultFastCopy);
-        chkFastCopy.Checked += (_, _) => { profile.FastSmallFileCopyOverride = true; SettingsStore.Save(); };
-        chkFastCopy.Unchecked += (_, _) => { profile.FastSmallFileCopyOverride = false; SettingsStore.Save(); };
-
-        var testedText = new TextBlock
-        {
-            Text = $"Настройки протестированы: {(profile.SettingsTested ? "да" : "нет")}",
-            Opacity = 0.8,
-        };
-
-        var btnTest = new Button
-        {
-            Content = "Тестировать эту флешку",
-            HorizontalAlignment = HorizontalAlignment.Left,
-            Margin = new Thickness(0, 8, 0, 0),
-        };
-        btnTest.Click += async (_, _) =>
-        {
-            btnTest.IsEnabled = false;
-            TxtGlobalStatus.Text = $"Тестирование «{profile.Label}»...";
-            try
-            {
-                if (!Directory.Exists(profile.DriveLetter + ":\\"))
-                {
-                    TxtGlobalStatus.Text = "Флешка не подключена — тест невозможен.";
-                    return;
-                }
-
-                profile.MirrorModeOverride = null;
-                profile.VerifyByCrcOverride = null;
-                profile.SkipHiddenSystemOverride = null;
-                profile.LiveWatchOverride = null;
-                profile.FastSmallFileCopyOverride = null;
-                profile.BufferSizeKbOverride = null;
-                profile.SettingsTested = false;
-
-                var progress = new Progress<SyncProgress>(p => OnProgress(p));
-                var session = _orchestrator.ActiveSessions.FirstOrDefault(s =>
-        ReferenceEquals(s.Profile, profile) ||
-        string.Equals(s.Profile.Serial, profile.Serial, System.StringComparison.OrdinalIgnoreCase));
-if (session is null)
-{
-    TxtGlobalStatus.Text = "Флешка не подключена — тест невозможен.";
-    return;
-}
-await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.Token, false);
-
-                chkMirror.IsChecked = profile.MirrorModeOverride ?? SettingsStore.Current.MirrorMode;
-                chkCrc.IsChecked = profile.VerifyByCrcOverride ?? SettingsStore.Current.VerifyByCrc;
-                chkHidden.IsChecked = profile.SkipHiddenSystemOverride ?? SettingsStore.Current.SkipHiddenSystem;
-                chkLive.IsChecked = profile.LiveWatchOverride ?? SettingsStore.Current.LiveWatch;
-                cmbBuffer.SelectedIndex = profile.BufferSizeKbOverride switch
-                {
-                    null => 0,
-                    512 => 1,
-                    1024 => 2,
-                    2048 => 3,
-                    4096 => 4,
-                    8192 => 5,
-                    16384 => 6,
-                    _ => profile.BufferSizeKbOverride < 768 ? 1 :
-                        (profile.BufferSizeKbOverride < 1536 ? 2 :
-                        (profile.BufferSizeKbOverride < 3072 ? 3 :
-                        (profile.BufferSizeKbOverride < 6144 ? 4 :
-                        (profile.BufferSizeKbOverride < 12288 ? 5 : 6)))),
-                };
-                chkFlush.IsChecked = profile.FlushAfterFileOverride ?? SettingsStore.Current.DefaultFlushAfterFile;
-                chkFastCopy.IsChecked = profile.FastSmallFileCopyOverride ?? SettingsStore.Current.DefaultFastCopy;
-                chkFastCopy.IsChecked = profile.FastSmallFileCopyOverride ?? SettingsStore.Current.DefaultFastCopy;
-
-                testedText.Text = $"Настройки протестированы: {(profile.SettingsTested ? "да" : "нет")}";
-                statusText.Text = BuildDriveStatusText(profile);
-                TxtGlobalStatus.Text = $"Тест флешки «{profile.Label}» завершён.";
-                RefreshList();
-            }
-            catch (Exception ex)
-            {
-                AppLog.Error(ex, "Ошибка ручного теста флешки");
-                TxtGlobalStatus.Text = "Ошибка теста: " + ex.Message;
-            }
-            finally
-            {
-                btnTest.IsEnabled = true;
-                await Task.Yield();
-                ShowIdle();
-            }
-        };
-
         var backupPathText = new TextBlock
         {
             Text = $"Папка хранения: {profile.BackupPath}",
@@ -1052,7 +830,7 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
         };
 
         var btnRelocateBackup = new Button { Content = "Изменить папку хранения..." };
-        var btnResetBackupPath = new Button { Content = "Сбросить папку хранения к стандартной" };
+        var btnResetBackupPath = new Button { Content = "Сбросить к стандартной" };
         btnRelocateBackup.Click += async (_, _) =>
         {
             try
@@ -1067,7 +845,7 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
                 if (canonical is null) return;
 
                 await RelocateDriveBackupAsync(profile, canonical, new Progress<SyncProgress>(p => OnProgress(p)));
-                _backupPresence.Clear();   // бэкап перенесён: старый и новый путь изменились
+                _backupPresence.Clear();
                 backupPathText.Text = $"Папка хранения: {profile.BackupPath}";
                 statusText.Text = BuildDriveStatusText(profile);
                 TxtGlobalStatus.Text = $"Папка хранения «{profile.Label}» изменена.";
@@ -1099,41 +877,6 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
             finally { await Task.Yield(); ShowIdle(); }
         };
 
-        var btnResetSettings = new Button { Content = "Сбросить настройки к стандартным" };
-        btnResetSettings.Click += (_, _) =>
-        {
-            profile.MirrorModeOverride = null;
-            profile.VerifyByCrcOverride = null;
-            profile.SkipHiddenSystemOverride = null;
-            profile.LiveWatchOverride = null;
-            profile.BufferSizeKbOverride = null;
-            profile.FlushAfterFileOverride = null;
-            profile.FastSmallFileCopyOverride = null;
-            profile.SettingsTested = false;
-            SettingsStore.Save();
-
-            chkMirror.IsChecked = SettingsStore.Current.MirrorMode;
-            chkCrc.IsChecked = SettingsStore.Current.VerifyByCrc;
-            chkHidden.IsChecked = SettingsStore.Current.SkipHiddenSystem;
-            chkLive.IsChecked = SettingsStore.Current.LiveWatch;
-            cmbBuffer.SelectedIndex = SettingsStore.Current.DefaultBufferSizeKb switch
-            {
-                512 => 1,
-                1024 => 2,
-                2048 => 3,
-                4096 => 4,
-                8192 => 5,
-                16384 => 6,
-                _ => 0, // «по стандарту»
-            };
-            chkFlush.IsChecked = SettingsStore.Current.DefaultFlushAfterFile;
-            chkFastCopy.IsChecked = SettingsStore.Current.DefaultFastCopy;
-            testedText.Text = "Настройки протестированы: нет";
-            statusText.Text = BuildDriveStatusText(profile);
-            TxtGlobalStatus.Text = $"Настройки «{profile.Label}» сброшены к стандартным.";
-            RefreshList();
-        };
-
         var stack = new StackPanel { Spacing = 10 };
         stack.Children.Add(new TextBlock
         {
@@ -1148,22 +891,8 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
             Spacing = 8,
             Children = { btnRelocateBackup, btnResetBackupPath },
         });
-        stack.Children.Add(new StackPanel
-        {
-            Orientation = Orientation.Horizontal,
-            Spacing = 8,
-            Children = { btnTest, btnResetSettings },
-        });
-        stack.Children.Add(statusText);
-        stack.Children.Add(chkMirror);
-        stack.Children.Add(chkHidden);
-        stack.Children.Add(chkFastCopy);
         stack.Children.Add(chkEnabled);
-        stack.Children.Add(chkLive);
-        stack.Children.Add(chkCrc);
-        stack.Children.Add(chkFlush);
-        stack.Children.Add(bufferLabel);
-        stack.Children.Add(cmbBuffer);
+        stack.Children.Add(statusText);
 
         var rootGrid = new Grid { Padding = new Thickness(16) };
         rootGrid.Children.Add(new ScrollViewer { Content = stack });
@@ -1270,7 +999,7 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
     }
 
     private static string BuildDriveStatusText(DriveProfile profile)
-        => $"Активна: {(profile.Enabled ? "да" : "нет")}; протестировано: {(profile.SettingsTested ? "да" : "нет")}";
+        => $"Активна: {(profile.Enabled ? "да" : "нет")}";
 
     private static CheckBox CreateLabeledCheckBox(string content, bool isChecked)
         => new CheckBox { Content = content, IsChecked = isChecked };
@@ -1468,7 +1197,6 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
 
         if (!profile.Enabled) return "Выключено";
         if (session is null) return "Не подключена";
-        if (session.PendingChanges) return "Подключена (ожидает синхронизации)";
         if (session.LastSuccessfulSyncUtc != DateTime.MinValue)
         {
             return session.State switch
@@ -1506,31 +1234,6 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
         GlobalProgressBar.IsIndeterminate = false;
         GlobalProgressBar.Value = 0;
         TxtGlobalStatus.Text = "";
-    }
-
-    private void ShowScanning(string drive, int count)
-    {
-        GlobalProgressBar.IsIndeterminate = true;
-        TxtGlobalStatus.Text = $"Сканирование [{drive}]: Файлов: {count}";
-    }
-
-    private void ShowCopying(string drive, int total, int copied, int skipped, string file, int percent)
-    {
-        GlobalProgressBar.IsIndeterminate = false;
-        GlobalProgressBar.Value = Math.Clamp(percent, 0, 100);
-        TxtGlobalStatus.Text = $"Копирование [{drive}]: Всего: {total} | Скопировано: {copied} | Пропущено: {skipped} | {System.IO.Path.GetFileName(file)}";
-    }
-
-    private void ShowPruning(string drive)
-    {
-        GlobalProgressBar.IsIndeterminate = true;
-        TxtGlobalStatus.Text = "Очистка...";
-    }
-
-    private void ShowWipe(string drive)
-    {
-        GlobalProgressBar.IsIndeterminate = true;
-        TxtGlobalStatus.Text = $"Удаление бэкапа [{drive}]...";
     }
 
     private void ResetProgressIfIdle()
@@ -1763,10 +1466,10 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
     private void OnProgress(SyncProgress p)
     {
         // ≤5 перерисовок/с (минимальная CPU-нагрузка), НО финальный статус — всегда.
-        // Смена фазы (сканирование/подключение/live-watch) не троттлим: иначе сразу
+        // Смена фазы (сканирование/подключение) не троттлится: иначе сразу
         // после выдёргивания флешки прогресс-бар может «не вернуться».
         bool isFinal = p.Phase is SyncPhase.Completed or SyncPhase.Error or SyncPhase.Cancelled or SyncPhase.Idle or SyncPhase.Wipe;
-        bool isStateChange = p.Phase is SyncPhase.Scanning or SyncPhase.Connecting or SyncPhase.LiveWatch;
+        bool isStateChange = p.Phase is SyncPhase.Scanning or SyncPhase.Connecting;
         if (!isFinal && !isStateChange && Stopwatch.GetTimestamp() - _lastProgressPaint < Stopwatch.Frequency / 5)
             return;
         _lastProgressPaint = Stopwatch.GetTimestamp();
@@ -1775,14 +1478,6 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
 
         switch (p.Phase)
         {
-            case SyncPhase.Testing:
-                GlobalProgressBar.Visibility = Visibility.Visible;
-                GlobalProgressBar.IsIndeterminate = true;
-                GlobalProgressBar.Maximum = 100;
-                GlobalProgressBar.Value = 0;
-                TxtGlobalStatus.Text = $"Тестирование {drive}";
-                break;
-
             case SyncPhase.Scanning:
                 GlobalProgressBar.Visibility = Visibility.Visible;
                 // Обход дерева может идти долго: показываем прогресс как пульсацию,
@@ -1824,16 +1519,6 @@ await _orchestrator.TestDriveSettingsAsync(profile, progress, session.DetachCts.
                 GlobalProgressBar.Maximum = p.TotalFiles > 0 ? p.TotalFiles : 1;
                 GlobalProgressBar.Value = p.ProcessedCount;
                 TxtGlobalStatus.Text = $"Удаление бэкапа {drive}";
-                break;
-
-            case SyncPhase.LiveWatch:
-                CleanupDriveState(p.DriveLetter);
-                GlobalProgressBar.Visibility = Visibility.Visible;
-                GlobalProgressBar.IsIndeterminate = false;
-                GlobalProgressBar.Maximum = 100;
-                GlobalProgressBar.Value = 100;
-                TxtGlobalStatus.Text = "Слежение за изменениями (Ожидание)";
-                RefreshList();
                 break;
 
             case SyncPhase.Connecting:
