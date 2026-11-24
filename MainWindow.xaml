@@ -2,9 +2,9 @@
 <!--
   Smart USB Backup — главное окно (WinUI 3).
 
-  Шаг 2 (исправление): TabView — корневой элемент окна, он занимает всё пространство.
-  Иконка и название помещены в TabStripHeader, пустая drag-зона (DragRegion) —
-  в TabStripFooter, справа от вкладок; системные кнопки учитываются через RightInset.
+  Одна страница: список флешек и действия. Заголовок окна — обычная строка
+  с иконкой, названием и кнопкой настроек; системные кнопки учитываются
+  через TitleBarRightSpacer.
 -->
 <Window
     x:Class="SmartUsbBackup.MainWindow"
@@ -13,21 +13,33 @@
     xmlns:core="using:SmartUsbBackup.Core"
     Title="Smart USB Backup">
 
-  <TabView
-      x:Name="MainTabView"
-      IsAddTabButtonVisible="False"
-      Background="Transparent"
-      Padding="0"
-      TabCloseRequested="MainTabView_TabCloseRequested">
+  <Grid x:Name="AppRoot" Background="Transparent">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*"   />
+    </Grid.RowDefinitions>
 
-    <!-- Левая часть верхней полосы: иконка + название программы -->
-    <TabView.TabStripHeader>
+    <!-- ==================== Строка заголовка ==================== -->
+    <Grid
+        x:Name="TitleBarGrid"
+        Grid.Row="0"
+        Height="36"
+        Padding="12,0,0,0"
+        ColumnSpacing="8"
+        Background="Transparent">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto" />
+        <ColumnDefinition Width="*"   />
+        <ColumnDefinition Width="Auto" />
+        <ColumnDefinition Width="Auto" />
+      </Grid.ColumnDefinitions>
+
       <StackPanel
           x:Name="TitleArea"
+          Grid.Column="0"
           Orientation="Horizontal"
           Spacing="8"
-          VerticalAlignment="Center"
-          Margin="12,0,8,0">
+          VerticalAlignment="Center">
         <Image
             Source="Assets/appicon.ico"
             Width="16"
@@ -39,230 +51,223 @@
             FontSize="12"
             Opacity="0.8" />
       </StackPanel>
-    </TabView.TabStripHeader>
 
-    <TabView.TabStripFooter>
-      <Border x:Name="TabStripSpacer"
-              Width="0"
-              Background="Transparent" />
-    </TabView.TabStripFooter>
+      <Button
+          x:Name="BtnSettings"
+          Grid.Column="2"
+          Style="{StaticResource SubtleButtonStyle}"
+          Click="OnSettingsClicked"
+          ToolTipService.ToolTip="Настройки"
+          HorizontalAlignment="Center"
+          VerticalAlignment="Center"
+          MinWidth="0"
+          Padding="8,4,8,4">
+        <FontIcon Glyph="&#xE713;" FontSize="16" />
+      </Button>
 
-    <TabViewItem Header="Синхронизация" IsClosable="False">
-      <Grid x:Name="RootGrid" Padding="16,10,16,14" RowSpacing="10" >
+      <Border
+          x:Name="TitleBarRightSpacer"
+          Grid.Column="3"
+          Width="0"
+          Background="Transparent" />
+    </Grid>
+
+    <!-- ==================== Основная страница ==================== -->
+    <Grid x:Name="RootGrid" Grid.Row="1" Padding="16,10,16,14" RowSpacing="10">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />  <!-- 0: путь -->
+        <RowDefinition Height="Auto" />  <!-- 1: кнопки -->
+        <RowDefinition Height="Auto" />  <!-- 2: прогресс -->
+        <RowDefinition Height="*"   />  <!-- 3: список флешек -->
+      </Grid.RowDefinitions>
+
+      <!-- ==================== ROW 0: Папка бэкапов ==================== -->
+      <Grid Grid.Row="0" ColumnSpacing="10">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+
+        <TextBlock
+            Grid.Column="0"
+            Text="Папка бэкапов:"
+            VerticalAlignment="Center" />
+
+        <TextBox
+            x:Name="TxtBackupPath"
+            Grid.Column="1"
+            HorizontalAlignment="Stretch"
+            IsReadOnly="True"
+            Text=""
+            VerticalAlignment="Center" />
+
+        <Button
+            x:Name="BtnBrowse"
+            Grid.Column="2"
+            Content="Обзор..."
+            Click="OnBrowseClicked"
+            VerticalAlignment="Center" />
+      </Grid>
+
+      <!-- ==================== ROW 1: Кнопки действий ==================== -->
+      <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="10">
+        <Button
+            x:Name="BtnSyncAll"
+            Content="Синхронизировать всё сейчас"
+            Style="{StaticResource AccentButtonStyle}"
+            Click="OnSyncAllClicked" />
+        <Button
+            x:Name="BtnWipeSelected"
+            Content="Удалить бэкап выбранной"
+            IsEnabled="False"
+            Click="OnWipeSelectedClicked" />
+      </StackPanel>
+
+      <!-- ==================== ROW 2: Блок прогресса ==================== -->
+      <Grid Grid.Row="2" RowSpacing="4">
         <Grid.RowDefinitions>
-          <RowDefinition Height="Auto" />  <!-- 0: путь -->
-          <RowDefinition Height="Auto" />  <!-- 1: кнопки -->
-          <RowDefinition Height="Auto" />  <!-- 2: прогресс -->
-          <RowDefinition Height="*"   />  <!-- 3: список флешек -->
+          <RowDefinition Height="Auto" />  <!-- 3.1: полоса прогресса -->
+          <RowDefinition Height="Auto" />  <!-- 3.2: текст -->
         </Grid.RowDefinitions>
 
-        <!-- ==================== ROW 0: Папка бэкапов ==================== -->
-        <Grid Grid.Row="0" ColumnSpacing="10">
-          <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="Auto" />
-            <ColumnDefinition Width="*" />
-            <ColumnDefinition Width="Auto" />
-          </Grid.ColumnDefinitions>
+        <ProgressBar
+            x:Name="GlobalProgressBar"
+            Grid.Row="0"
+            Value="0"
+            IsIndeterminate="False"
+            Height="12"
+            CornerRadius="8"
+            Background="{ThemeResource ControlFillColorDefaultBrush}"
+            HorizontalAlignment="Stretch" />
 
-          <TextBlock
-              Grid.Column="0"
-              Text="Папка бэкапов:"
-              VerticalAlignment="Center" />
+        <TextBlock
+            x:Name="TxtGlobalStatus"
+            Grid.Row="1"
+            HorizontalAlignment="Stretch"
+            MaxLines="2"
+            TextTrimming="CharacterEllipsis"
+            TextWrapping="Wrap"
+            Text="" />
+      </Grid>
 
-          <TextBox
-              x:Name="TxtBackupPath"
-              Grid.Column="1"
-              HorizontalAlignment="Stretch"
-              IsReadOnly="True"
-              Text=""
-              VerticalAlignment="Center" />
-
-          <Button
-              x:Name="BtnBrowse"
-              Grid.Column="2"
-              Content="Обзор..."
-              Click="OnBrowseClicked"
-              VerticalAlignment="Center" />
-        </Grid>
-
-        <!-- ==================== ROW 1: Кнопки действий ==================== -->
-        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="10">
-          <Button
-              x:Name="BtnSyncAll"
-              Content="Синхронизировать всё сейчас"
-              Style="{StaticResource AccentButtonStyle}"
-              Click="OnSyncAllClicked" />
-          <Button
-              x:Name="BtnWipeSelected"
-              Content="Удалить бэкап выбранной"
-              IsEnabled="False"
-              Click="OnWipeSelectedClicked" />
-        </StackPanel>
-
-        <!-- ==================== ROW 2: Блок прогресса ==================== -->
-        <Grid Grid.Row="2" RowSpacing="4">
+      <!-- ==================== ROW 3: Список флешек ==================== -->
+      <Border
+          Grid.Row="3"
+          CornerRadius="6"
+          BorderThickness="1"
+          BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+          Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+        <Grid>
           <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />  <!-- 3.1: полоса прогресса -->
-            <RowDefinition Height="Auto" />  <!-- 3.2: текст -->
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*"   />
           </Grid.RowDefinitions>
 
-          <ProgressBar
-              x:Name="GlobalProgressBar"
-              Grid.Row="0"
-              Value="0"
-              IsIndeterminate="False"
-               Height="12"
-               CornerRadius="8"
-               Background="{ThemeResource ControlFillColorDefaultBrush}"
-              HorizontalAlignment="Stretch" />
+          <!-- Шапка таблицы -->
+          <Grid Grid.Row="0" Padding="12,7,12,7" ColumnSpacing="10"
+                Background="{ThemeResource SubtleFillColorSecondaryBrush}">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="25*" />
+              <ColumnDefinition Width="15*" />
+              <ColumnDefinition Width="15*" />
+              <ColumnDefinition Width="10*" />
+              <ColumnDefinition Width="30*" />
+              <ColumnDefinition Width="5*" />
+            </Grid.ColumnDefinitions>
 
-          <TextBlock
-              x:Name="TxtGlobalStatus"
-              Grid.Row="1"
-              HorizontalAlignment="Stretch"
-              MaxLines="2"
-              TextTrimming="CharacterEllipsis"
-              TextWrapping="Wrap"
-              Text="" />
-        </Grid>
-
-        <!-- ==================== ROW 4: Список флешек ==================== -->
-        <Border
-            Grid.Row="3"
-            CornerRadius="6"
-            BorderThickness="1"
-            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
-          <Grid>
-            <Grid.RowDefinitions>
-              <RowDefinition Height="Auto" />
-              <RowDefinition Height="*"   />
-            </Grid.RowDefinitions>
-
-            <!-- Шапка таблицы -->
-            <Grid Grid.Row="0" Padding="12,7,12,7" ColumnSpacing="10"
-                  Background="{ThemeResource SubtleFillColorSecondaryBrush}">
-              <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="25*" />
-                  <ColumnDefinition Width="15*" />
-                  <ColumnDefinition Width="15*" />
-                  <ColumnDefinition Width="10*" />
-                  <ColumnDefinition Width="30*" />
-                  <ColumnDefinition Width="5*" />
-              </Grid.ColumnDefinitions>
-
-              <TextBlock Grid.Column="0" Text="Имя (серийник)" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
-              <TextBlock Grid.Column="1" Text="Состояние"      FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
-              <TextBlock Grid.Column="2" Text="Сохранение"     FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
-              <TextBlock Grid.Column="3" Text="Активна"        FontWeight="SemiBold" HorizontalAlignment="Center" />
-              <TextBlock Grid.Column="4" Text="Путь к папке"   FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
-            </Grid>
-
-            <!-- Строки флешек -->
-            <ListView
-                x:Name="DriveList"
-                HorizontalContentAlignment="Stretch"
-                SelectionMode="Single"
-                Grid.Row="1"
-                SelectionChanged="OnListSelectionChanged"
-                DoubleTapped="OnListDoubleTapped"
-                ScrollViewer.VerticalScrollMode="Enabled"
-                ScrollViewer.VerticalScrollBarVisibility="Auto"
-                ScrollViewer.HorizontalScrollMode="Disabled"
-                ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-
-              <ListView.ItemTemplate>
-                <DataTemplate x:DataType="core:DriveRow">
-                  <Grid Padding="12,8,12,8" ColumnSpacing="10">
-                    <Grid.ColumnDefinitions>
-                      <ColumnDefinition Width="25*" />
-                      <ColumnDefinition Width="15*" />
-                      <ColumnDefinition Width="15*" />
-                      <ColumnDefinition Width="10*" />
-                      <ColumnDefinition Width="30*" />
-                      <ColumnDefinition Width="5*" />
-                    </Grid.ColumnDefinitions>
-
-                    <TextBlock
-                        Grid.Column="0"
-                        Text="{x:Bind Name, Mode=OneWay}"
-                        TextTrimming="CharacterEllipsis"
-                         VerticalAlignment="Center" />
-
-                    <TextBlock
-                        Grid.Column="1"
-                        Text="{x:Bind State, Mode=OneWay}"
-                        TextTrimming="CharacterEllipsis"
-                         VerticalAlignment="Center" />
-
-                    <TextBlock
-                        Grid.Column="2"
-                        Text="{x:Bind BackupState, Mode=OneWay}"
-                        TextTrimming="CharacterEllipsis"
-                         VerticalAlignment="Center" />
-
-                    <CheckBox
-                        Grid.Column="3"
-                        IsChecked="{x:Bind Enabled, Mode=TwoWay}"
-                        Checked="OnRowEnabledChecked"
-                        Unchecked="OnRowEnabledUnchecked"
-                        HorizontalAlignment="Center"
-                         MinWidth="0" />
-
-                    <TextBlock
-                        Grid.Column="4"
-                        Text="{x:Bind BackupPath}"
-                        TextTrimming="CharacterEllipsis"
-                         VerticalAlignment="Center"
-                        ToolTipService.ToolTip="{x:Bind BackupPath}" />
-
-                    <Button
-                        Grid.Column="5"
-                        Style="{StaticResource SubtleButtonStyle}"
-                        Click="PerDriveSettings_Click"
-                        ToolTipService.ToolTip="Настройки флешки"
-                        HorizontalAlignment="Center"
-                        VerticalAlignment="Center"
-                        MinWidth="0"
-                        Padding="4,2,4,2">
-                      <FontIcon Glyph="&#xE713;" FontSize="16" />
-                    </Button>
-                  </Grid>
-                </DataTemplate>
-              </ListView.ItemTemplate>
-
-              <ListView.ItemContainerStyle>
-                <Style TargetType="ListViewItem">
-                  <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                  <Setter Property="Padding" Value="0" />
-                  <Setter Property="MinHeight" Value="36" />
-                </Style>
-              </ListView.ItemContainerStyle>
-            </ListView>
+            <TextBlock Grid.Column="0" Text="Имя (серийник)" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+            <TextBlock Grid.Column="1" Text="Состояние"      FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+            <TextBlock Grid.Column="2" Text="Сохранение"     FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+            <TextBlock Grid.Column="3" Text="Активна"        FontWeight="SemiBold" HorizontalAlignment="Center" />
+            <TextBlock Grid.Column="4" Text="Путь к папке"   FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
           </Grid>
-        </Border>
 
-        <!-- Иконка в трее создаётся в коде (NativeTrayIcon) — вне визуального дерева. -->
-      </Grid>
-    </TabViewItem>
+          <!-- Строки флешек -->
+          <ListView
+              x:Name="DriveList"
+              HorizontalContentAlignment="Stretch"
+              SelectionMode="Single"
+              Grid.Row="1"
+              SelectionChanged="OnListSelectionChanged"
+              DoubleTapped="OnListDoubleTapped"
+              ScrollViewer.VerticalScrollMode="Enabled"
+              ScrollViewer.VerticalScrollBarVisibility="Auto"
+              ScrollViewer.HorizontalScrollMode="Disabled"
+              ScrollViewer.HorizontalScrollBarVisibility="Disabled">
 
-    <TabViewItem Header="Настройки" IsClosable="False">
-      <ScrollViewer VerticalScrollBarVisibility="Auto" VerticalScrollMode="Enabled" Padding="0">
-        <StackPanel Padding="24,20,24,24" Spacing="12">
-          <TextBlock Text="Настройки" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,8" />
+            <ListView.ItemTemplate>
+              <DataTemplate x:DataType="core:DriveRow">
+                <Grid Padding="12,8,12,8" ColumnSpacing="10">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="25*" />
+                    <ColumnDefinition Width="15*" />
+                    <ColumnDefinition Width="15*" />
+                    <ColumnDefinition Width="10*" />
+                    <ColumnDefinition Width="30*" />
+                    <ColumnDefinition Width="5*" />
+                  </Grid.ColumnDefinitions>
 
-          <TextBlock Text="Папка хранения бэкапов:" Margin="0,8,0,0" />
-          <TextBox x:Name="TxtSettingsBackupPath" IsReadOnly="True" Text="" />
-          <Button Content="Выбрать папку хранения..." Click="OnSettingsBrowseClicked" />
+                  <TextBlock
+                      Grid.Column="0"
+                      Text="{x:Bind Name, Mode=OneWay}"
+                      TextTrimming="CharacterEllipsis"
+                      VerticalAlignment="Center" />
 
-          <CheckBox x:Name="ChkStartup"  Content="Запускать с Windows" Checked="OnStartupChecked"  Unchecked="OnStartupUnchecked" />
-          <CheckBox x:Name="ChkAutoUpdate" Content="Автообновление приложения" Checked="OnAutoUpdateChecked" Unchecked="OnAutoUpdateUnchecked" />
+                  <TextBlock
+                      Grid.Column="1"
+                      Text="{x:Bind State, Mode=OneWay}"
+                      TextTrimming="CharacterEllipsis"
+                      VerticalAlignment="Center" />
 
-          <TextBlock Text="Копирование всегда зеркальное: файлы, удалённые на флешке, удаляются и в бэкапе. Скрытые и системные файлы не копируются."
-                     TextWrapping="Wrap" Opacity="0.8" Margin="0,8,0,0" />
-        </StackPanel>
-      </ScrollViewer>
-    </TabViewItem>
+                  <TextBlock
+                      Grid.Column="2"
+                      Text="{x:Bind BackupState, Mode=OneWay}"
+                      TextTrimming="CharacterEllipsis"
+                      VerticalAlignment="Center" />
 
-  </TabView>
+                  <CheckBox
+                      Grid.Column="3"
+                      IsChecked="{x:Bind Enabled, Mode=TwoWay}"
+                      Checked="OnRowEnabledChecked"
+                      Unchecked="OnRowEnabledUnchecked"
+                      HorizontalAlignment="Center"
+                      MinWidth="0" />
+
+                  <TextBlock
+                      Grid.Column="4"
+                      Text="{x:Bind BackupPath}"
+                      TextTrimming="CharacterEllipsis"
+                      VerticalAlignment="Center"
+                      ToolTipService.ToolTip="{x:Bind BackupPath}" />
+
+                  <Button
+                      Grid.Column="5"
+                      Style="{StaticResource SubtleButtonStyle}"
+                      Click="PerDriveSettings_Click"
+                      ToolTipService.ToolTip="Настройки флешки"
+                      HorizontalAlignment="Center"
+                      VerticalAlignment="Center"
+                      MinWidth="0"
+                      Padding="4,2,4,2">
+                    <FontIcon Glyph="&#xE713;" FontSize="16" />
+                  </Button>
+                </Grid>
+              </DataTemplate>
+            </ListView.ItemTemplate>
+
+            <ListView.ItemContainerStyle>
+              <Style TargetType="ListViewItem">
+                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                <Setter Property="Padding" Value="0" />
+                <Setter Property="MinHeight" Value="36" />
+              </Style>
+            </ListView.ItemContainerStyle>
+          </ListView>
+        </Grid>
+      </Border>
+
+      <!-- Иконка в трее создаётся в коде (NativeTrayIcon) — вне визуального дерева. -->
+    </Grid>
+  </Grid>
 </Window>

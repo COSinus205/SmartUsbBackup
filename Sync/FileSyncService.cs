@@ -389,7 +389,10 @@ public sealed class FileSyncService
         {
             RecurseSubdirectories = true,
             IgnoreInaccessible = true,
-            AttributesToSkip = FileAttributes.ReparsePoint,
+            // Скрытые/системные файлы не копируются с флешки, поэтому зеркальная
+            // чистка не должна их удалять: иначе первый прогон после обновления
+            // снесёт то, что было сохранено старыми версиями.
+            AttributesToSkip = FileAttributes.Hidden | FileAttributes.System | FileAttributes.ReparsePoint,
         };
         foreach (var fi in new DirectoryInfo(targetDir).EnumerateFiles("*", opts))
         {

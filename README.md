@@ -91,7 +91,7 @@ dotnet build -c Release
 | `SmartUsbBackup.WinUI.csproj` | Основной проект WinUI 3 (.NET 8, unpackaged, self-contained). |
 | `app.manifest` | Манифест приложения (DPI-aware, UAC). |
 | `App.xaml` / `App.xaml.cs` | Точка входа: одиночный экземпляр, аргумент `-hidden`, исключения. |
-| `MainWindow.xaml` / `MainWindow.xaml.cs` | Главное окно, вкладки, таблица флешек, логика UI. |
+| `MainWindow.xaml` / `MainWindow.xaml.cs` | Главное окно, таблица флешек, диалоги настроек, логика UI. |
 | `Assets/appicon.ico` | Иконка приложения/окна/установщика. |
 | `build-installer.bat` | Сборка через `dotnet publish` + Inno Setup. |
 | `README.md` | Документация проекта. |
@@ -107,7 +107,7 @@ dotnet build -c Release
 | `Interop/NativeMethods.cs` | Win32-interop/helper'ы (ShowWindow, SetForegroundWindow и др.). |
 | `Interop/WindowMinSize.cs` | Минимальный размер окна через `WM_GETMINMAXINFO`. |
 | `Properties/AssemblyInfo.cs` | `InternalsVisibleTo("SmartUsbBackup.Tests")`. |
-| `SmartUsbBackup.Tests/` | xUnit-тесты: 82 тестовых случая. |
+| `SmartUsbBackup.Tests/` | xUnit-тесты: 85 тестовых случаев. |
 | `installer/SmartUsbBackup.iss` | Скрипт Inno Setup (per-user install, деинсталляция, Pascal Script). |
 | `installer/dist/SmartUsbBackup-Setup-4.3.2.exe` | Собранный установщик (релиз). |
 | `CHANGELOG.md` | История изменений. |
@@ -124,7 +124,7 @@ dotnet build -c Release
 dotnet test SmartUsbBackup.Tests/SmartUsbBackup.Tests.csproj
 ```
 
-Все 82 тестовых случая.
+Все 85 тестовых случаев.
 
 Сборка без Visual Studio:
 

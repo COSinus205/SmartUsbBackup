@@ -160,8 +160,13 @@ public static class SettingsStore
                     }
 
                     // Нормализуем Profile.FolderName и персональные пути хранения.
-                    foreach (var d in s.Drives ?? new List<DriveProfile>())
+                    // Явные null в JSON не должны превращаться в NRE дальше по коду.
+                    s.Drives ??= new List<DriveProfile>();
+                    foreach (var d in s.Drives)
                     {
+                        d.Serial ??= "";
+                        d.Label ??= "";
+
                         if (IsUnsafeFolderName(d.FolderName))
                         {
                             AppLog.Warn("Небезопасное имя папки профиля — перегенерировано: " + d.FolderName);
@@ -313,17 +318,17 @@ public static class SettingsStore
     }
 
     /// <summary>"USB_Метка_Serial" — безопасное для файловой системы имя подпапки.</summary>
-    private static string BuildFolderName(string label, string serial)
+    private static string BuildFolderName(string? label, string? serial)
     {
         var INVALID = new[] { '\\', '/', ':', '*', '?', '"', '<', '>', '|' };
-        var chars = label.ToCharArray();
+        var chars = (label ?? string.Empty).ToCharArray();
         var sb = new System.Text.StringBuilder("USB_");
         foreach (var ch in chars)
         {
             if (Array.IndexOf(INVALID, ch) >= 0 || char.IsControl(ch)) sb.Append('_');
             else sb.Append(ch);
         }
-        sb.Append('_').Append(serial.Replace("-", "").Replace(":", ""));
+        sb.Append('_').Append((serial ?? string.Empty).Replace("-", "").Replace(":", ""));
 
         // SEC: C-01 — финальная санитизация.
         var name = sb.ToString().TrimEnd(' ', '.');

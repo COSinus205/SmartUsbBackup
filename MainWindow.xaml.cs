@@ -63,6 +63,7 @@ public sealed partial class MainWindow : Window
     private readonly BackupPresenceCache _backupPresence = new();
 
 
+
     public MainWindow(bool startHidden)
     {
         // Признак тихого старта нужен только App (окно не активируется), внутри окна
@@ -114,10 +115,6 @@ public sealed partial class MainWindow : Window
 
         DriveList.ItemsSource = _rows;
 
-        // Начальные значения чекбоксов.
-        ChkAutoUpdate.IsChecked = SettingsStore.Current.AutoCheckForUpdates;
-        TxtSettingsBackupPath.Text = SettingsStore.Current.BaseBackupPath;
-        RefreshStartupCheckboxFromRegistry();
         TxtBackupPath.Text = SettingsStore.Current.BaseBackupPath;
 
         RefreshList();
@@ -160,17 +157,16 @@ public sealed partial class MainWindow : Window
         // показа не держится (окно открывалось 640×427 вместо 960×640).
         Activated += OnFirstActivated;
 
-        // ---------- Кастомный TitleBar (Вкладки сливаются с верхней панелью) ----------
+        // ---------- Кастомный TitleBar (строка заголовка над списком) ----------
         ExtendsContentIntoTitleBar = true;
-        try { SetTitleBar(MainTabView); } catch { /* не критично */ }
+        try { SetTitleBar(TitleBarGrid); } catch { /* не критично */ }
 
         var systemBar = AppWindow.TitleBar;
         systemBar.ButtonBackgroundColor = Microsoft.UI.Colors.Transparent;
         systemBar.ButtonInactiveBackgroundColor = Microsoft.UI.Colors.Transparent;
         systemBar.PreferredHeightOption = TitleBarHeightOption.Standard;
 
-        // Контейнер верхней панели появляется только после применения шаблона:
-        MainTabView.Loaded += (_, _) => ApplyTitleBarInsets();
+        TitleBarGrid.Loaded += (_, _) => ApplyTitleBarInsets();
         SizeChanged += (_, _) => ApplyTitleBarInsets();
         Activated += (_, _) => ApplyTitleBarInsets();
 
@@ -248,7 +244,7 @@ public sealed partial class MainWindow : Window
     {
         try
         {
-            if (MainTabView is null) return;
+            if (TitleBarGrid is null) return;
 
             double scale = Content?.XamlRoot?.RasterizationScale ?? 0;
             if (scale <= 0)
@@ -262,17 +258,8 @@ public sealed partial class MainWindow : Window
             if (rightInsetDip < 0) rightInsetDip = 0;
             double leftInsetDip = AppWindow.TitleBar.LeftInset / scale;
 
-            // Контент вкладок должен быть на всю ширину: отступ сбрасываем.
-            MainTabView.Margin = new Thickness(0);
-
-            var titleArea = MainTabView.FindName("TitleArea") as StackPanel;
-            if (titleArea is not null)
-                titleArea.Margin = new Thickness(Math.Max(0, leftInsetDip), 0, 8, 0);
-
-            // Правый отступ только для шапки вкладок (System buttons area).
-            var tabStripSpacer = MainTabView.FindName("TabStripSpacer") as Microsoft.UI.Xaml.FrameworkElement;
-            if (tabStripSpacer is not null)
-                tabStripSpacer.Width = Math.Max(0, rightInsetDip);
+            TitleArea.Margin = new Thickness(Math.Max(0, leftInsetDip), 0, 8, 0);
+            TitleBarRightSpacer.Width = Math.Max(0, rightInsetDip);
         }
         catch (Exception ex)
         {
@@ -449,9 +436,28 @@ public sealed partial class MainWindow : Window
 
     private void OnDriveQueryRemoveFailedUi(char letter)
     {
+        // Возвращаем сессию в Attached: иначе она навсегда останется Detaching,
+        // и следующая попытка извлечения сразу получит TRUE без ожидания записи.
+        _orchestrator.OnDriveQueryRemoveFailed(letter);
+
+        var session = _orchestrator.ActiveSessions.FirstOrDefault(s => s.Letter == letter);
+        var profile = session?.Profile;
+
         SetDriveAttachmentStatus(letter, "Подключена");
         RefreshList();
-        TxtGlobalStatus.Text = "Извлечение отменено — синхронизация возобновлена";
+
+        // QUERYREMOVE отменил копирование, но извлечение не состоялось:
+        // для включённой и всё ещё подключённой флешки запускаем прогон заново.
+        bool resumed = profile is not null &&
+                       profile.Enabled &&
+                       session!.AttachmentState == DriveAttachmentState.Attached;
+        if (resumed)
+            _orchestrator.SyncOne(profile!);
+
+        TxtGlobalStatus.Text = resumed
+            ? "Извлечение отменено — копирование возобновлено"
+            : "Извлечение отменено";
+
         if (IsWindowHidden())
             SafeNotify("Smart USB Backup", "Извлечение отменено");
     }
@@ -572,7 +578,6 @@ public sealed partial class MainWindow : Window
         if (string.Equals(Path.GetFullPath(oldBase), canonical, StringComparison.OrdinalIgnoreCase))
         {
             TxtBackupPath.Text = SettingsStore.Current.BaseBackupPath;
-            TxtSettingsBackupPath.Text = SettingsStore.Current.BaseBackupPath;
             return;
         }
 
@@ -610,7 +615,6 @@ public sealed partial class MainWindow : Window
         SettingsStore.Save();
         _backupPresence.Clear();
         TxtBackupPath.Text = canonical;
-        TxtSettingsBackupPath.Text = canonical;
         AppLog.Info("Глобальная папка хранения бэкапов изменена: " + canonical);
 
         if (migrate)
@@ -687,40 +691,91 @@ public sealed partial class MainWindow : Window
 
     // ---------- Настройки ----------
 
-    private async void OnSettingsBrowseClicked(object sender, RoutedEventArgs e)
+    /// <summary>Кнопка с шестерёнкой в строке заголовка: общие настройки.</summary>
+    private async void OnSettingsClicked(object sender, RoutedEventArgs e)
     {
-        try
+        var pathBox = new TextBox
         {
-            var picker = new FolderPicker { SuggestedStartLocation = PickerLocationId.DocumentsLibrary };
-            picker.FileTypeFilter.Add("*");
-            WinRT.Interop.InitializeWithWindow.Initialize(picker, _hwnd);
-            var folder = await picker.PickSingleFolderAsync();
-            if (folder is null) return;
+            IsReadOnly = true,
+            Text = SettingsStore.Current.BaseBackupPath,
+        };
 
-            await ChangeGlobalBackupPathAsync(folder.Path);
-        }
-        catch (Exception ex)
+        var chkStartup = new CheckBox
         {
-            AppLog.Error(ex, "Не удалось выбрать папку хранения бэкапов");
-            await ShowInfoAsync("Ошибка", "Не удалось открыть диалог выбора папки:\n" + ex.Message);
-        }
+            Content = "Запускать с Windows",
+            IsChecked = CurrentRunAtStartup(),
+        };
+        chkStartup.Checked += (_, _) => ToggleStartup(enable: true);
+        chkStartup.Unchecked += (_, _) => ToggleStartup(enable: false);
+
+        var chkAutoUpdate = new CheckBox
+        {
+            Content = "Автообновление приложения",
+            IsChecked = SettingsStore.Current.AutoCheckForUpdates,
+        };
+        chkAutoUpdate.Checked += (_, _) => SaveSetting(s => s.AutoCheckForUpdates = true);
+        chkAutoUpdate.Unchecked += (_, _) => SaveSetting(s => s.AutoCheckForUpdates = false);
+
+        var dialog = new ContentDialog
+        {
+            Title = "Настройки",
+            CloseButtonText = "Закрыть",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = Content.XamlRoot,
+        };
+
+        string? chosenPath = null;
+        var btnBrowse = new Button
+        {
+            Content = "Выбрать папку хранения...",
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+        btnBrowse.Click += async (_, _) =>
+        {
+            try
+            {
+                var picker = new FolderPicker { SuggestedStartLocation = PickerLocationId.DocumentsLibrary };
+                picker.FileTypeFilter.Add("*");
+                WinRT.Interop.InitializeWithWindow.Initialize(picker, _hwnd);
+                var folder = await picker.PickSingleFolderAsync();
+                if (folder is null) return;
+
+                // Смена папки может показать свой диалог — закрываем настройки,
+                // чтобы не открывать два ContentDialog одновременно.
+                chosenPath = folder.Path;
+                dialog.Hide();
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error(ex, "Не удалось выбрать папку хранения бэкапов");
+            }
+        };
+
+        var panel = new StackPanel { Spacing = 12, MinWidth = 400 };
+        panel.Children.Add(new TextBlock { Text = "Папка хранения бэкапов:" });
+        panel.Children.Add(pathBox);
+        panel.Children.Add(btnBrowse);
+        panel.Children.Add(chkStartup);
+        panel.Children.Add(chkAutoUpdate);
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Копирование всегда зеркальное: файлы, удалённые на флешке, удаляются и в бэкапе. " +
+                   "Скрытые и системные файлы не копируются.",
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.8,
+        });
+
+        dialog.Content = new ScrollViewer { Content = panel, MaxHeight = 480 };
+        await dialog.ShowAsync();
+
+        if (chosenPath is not null)
+            await ChangeGlobalBackupPathAsync(chosenPath);
     }
-    private void OnAutoUpdateChecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.AutoCheckForUpdates = true);
-    private void OnAutoUpdateUnchecked(object sender, RoutedEventArgs e) => SaveSetting(s => s.AutoCheckForUpdates = false);
-
-    private void OnStartupChecked(object sender, RoutedEventArgs e) => ToggleStartup(enable: true);
-    private void OnStartupUnchecked(object sender, RoutedEventArgs e) => ToggleStartup(enable: false);
 
     private static void SaveSetting(Action<AppSettings> apply)
     {
         apply(SettingsStore.Current);
         SettingsStore.Save();
-    }
-
-    private void RefreshStartupCheckboxFromRegistry()
-    {
-        // Установщик мог уже включить автозапуск — ориентируемся на реестр.
-        ChkStartup.IsChecked = CurrentRunAtStartup();
     }
 
     private void ToggleStartup(bool enable)
@@ -763,11 +818,6 @@ public sealed partial class MainWindow : Window
 
 
 
-    private void MainTabView_TabCloseRequested(TabView sender, TabViewTabCloseRequestedEventArgs args)
-    {
-        sender.TabItems.Remove(args.Tab);
-    }
-
     private void OnListDoubleTapped(object sender, Microsoft.UI.Xaml.Input.DoubleTappedRoutedEventArgs e)
     {
         // Двойной клик по строке — немедленная синхронизация этой флешки.
@@ -775,23 +825,10 @@ public sealed partial class MainWindow : Window
             _orchestrator.SyncOne(row.Profile);
     }
 
-    private void PerDriveSettings_Click(object sender, RoutedEventArgs e)
+    private async void PerDriveSettings_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not FrameworkElement { DataContext: DriveRow row })
             return;
-
-        string driveId = !string.IsNullOrWhiteSpace(row.Profile.Serial)
-            ? row.Profile.Serial
-            : row.Name;
-
-        foreach (var item in MainTabView.TabItems)
-        {
-            if (item is TabViewItem existingTab && existingTab.Tag as string == driveId)
-            {
-                MainTabView.SelectedItem = existingTab;
-                return;
-            }
-        }
 
         var profile = row.Profile;
 
@@ -829,8 +866,20 @@ public sealed partial class MainWindow : Window
             TextWrapping = TextWrapping.Wrap,
         };
 
+        var dialog = new ContentDialog
+        {
+            Title = row.Name,
+            CloseButtonText = "Закрыть",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = Content.XamlRoot,
+        };
+
+        string? chosenBase = null;
+        bool resetToDefault = false;
+
         var btnRelocateBackup = new Button { Content = "Изменить папку хранения..." };
         var btnResetBackupPath = new Button { Content = "Сбросить к стандартной" };
+
         btnRelocateBackup.Click += async (_, _) =>
         {
             try
@@ -841,49 +890,24 @@ public sealed partial class MainWindow : Window
                 var folder = await picker.PickSingleFolderAsync();
                 if (folder is null) return;
 
-                var canonical = await ValidateChosenBaseAsync(folder.Path);
-                if (canonical is null) return;
-
-                await RelocateDriveBackupAsync(profile, canonical, new Progress<SyncProgress>(p => OnProgress(p)));
-                _backupPresence.Clear();
-                backupPathText.Text = $"Папка хранения: {profile.BackupPath}";
-                statusText.Text = BuildDriveStatusText(profile);
-                TxtGlobalStatus.Text = $"Папка хранения «{profile.Label}» изменена.";
-                RefreshList();
+                // Перенос покажет прогресс в главном окне — закрываем настройки,
+                // чтобы не держать модальный диалог поверх индикатора.
+                chosenBase = folder.Path;
+                dialog.Hide();
             }
             catch (Exception ex)
             {
-                AppLog.Error(ex, "Ошибка изменения папки хранения флешки");
-                TxtGlobalStatus.Text = "Ошибка: " + ex.Message;
+                AppLog.Error(ex, "Не удалось выбрать папку хранения флешки");
             }
-            finally { await Task.Yield(); ShowIdle(); }
-        };
-        btnResetBackupPath.Click += async (_, _) =>
-        {
-            try
-            {
-                await RelocateDriveBackupAsync(profile, SettingsStore.Current.BaseBackupPath, new Progress<SyncProgress>(p => OnProgress(p)));
-                _backupPresence.Clear();
-                backupPathText.Text = $"Папка хранения: {profile.BackupPath}";
-                statusText.Text = BuildDriveStatusText(profile);
-                TxtGlobalStatus.Text = $"Папка хранения «{profile.Label}» сброшена к стандартной.";
-                RefreshList();
-            }
-            catch (Exception ex)
-            {
-                AppLog.Error(ex, "Ошибка сброса папки хранения флешки");
-                TxtGlobalStatus.Text = "Ошибка: " + ex.Message;
-            }
-            finally { await Task.Yield(); ShowIdle(); }
         };
 
-        var stack = new StackPanel { Spacing = 10 };
-        stack.Children.Add(new TextBlock
+        btnResetBackupPath.Click += (_, _) =>
         {
-            Text = $"{row.Name} — {profile.Serial}",
-            FontSize = 18,
-            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-        });
+            resetToDefault = true;
+            dialog.Hide();
+        };
+
+        var stack = new StackPanel { Spacing = 10, MinWidth = 420 };
         stack.Children.Add(backupPathText);
         stack.Children.Add(new StackPanel
         {
@@ -894,19 +918,41 @@ public sealed partial class MainWindow : Window
         stack.Children.Add(chkEnabled);
         stack.Children.Add(statusText);
 
-        var rootGrid = new Grid { Padding = new Thickness(16) };
-        rootGrid.Children.Add(new ScrollViewer { Content = stack });
+        dialog.Content = new ScrollViewer { Content = stack, MaxHeight = 480 };
+        await dialog.ShowAsync();
 
-        var tab = new TabViewItem
+        try
         {
-            Header = row.Name,
-            IsClosable = true,
-            Tag = driveId,
-            Content = rootGrid,
-        };
+            if (resetToDefault)
+            {
+                await RelocateDriveBackupAsync(profile, SettingsStore.Current.BaseBackupPath,
+                    new Progress<SyncProgress>(p => OnProgress(p)));
+                _backupPresence.Clear();
+                TxtGlobalStatus.Text = $"Папка хранения «{profile.Label}» сброшена к стандартной.";
+                RefreshList();
+            }
+            else if (chosenBase is not null)
+            {
+                var canonical = await ValidateChosenBaseAsync(chosenBase);
+                if (canonical is null) return;
 
-        MainTabView.TabItems.Add(tab);
-        MainTabView.SelectedItem = tab;
+                await RelocateDriveBackupAsync(profile, canonical,
+                    new Progress<SyncProgress>(p => OnProgress(p)));
+                _backupPresence.Clear();
+                TxtGlobalStatus.Text = $"Папка хранения «{profile.Label}» изменена.";
+                RefreshList();
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, "Ошибка изменения папки хранения флешки");
+            TxtGlobalStatus.Text = "Ошибка: " + ex.Message;
+        }
+        finally
+        {
+            // Не сбрасываем прогресс чужой активной синхронизации.
+            ResetProgressIfIdle();
+        }
     }
 
     private async Task RelocateDriveBackupAsync(DriveProfile profile, string newBase, IProgress<SyncProgress> progress)
@@ -960,6 +1006,11 @@ public sealed partial class MainWindow : Window
 
         progress.Report(new SyncProgress(profile.DriveLetter, 1, 1, 0, 0, 0, 1, "", SyncPhase.Moving) { DriveName = profile.Label });
         AppLog.Info($"Папка хранения флешки «{profile.Label}» перенесена: {oldPath} -> {newPath}");
+
+        // Перенос останавливал синхронизацию: для включённой флешки продолжаем
+        // прогон уже в новую папку (если она всё ещё подключена).
+        if (profile.Enabled)
+            _orchestrator.SyncOne(profile);
     }
 
     private static void MoveDirectoryTree(string source, string destination)
@@ -1016,6 +1067,7 @@ public sealed partial class MainWindow : Window
         return null;
     }
 
+    /// <summary>Прокрутка списка колесом мыши, перехваченным в WndProc.</summary>
     public static void HandleMouseWheel(int delta)
     {
         var instance = Instance;
@@ -1026,11 +1078,9 @@ public sealed partial class MainWindow : Window
         {
             try
             {
-                var tab = instance.MainTabView.SelectedItem as TabViewItem;
-                var content = tab?.Content as FrameworkElement ?? instance.MainTabView as FrameworkElement;
-                if (content is null) return;
+                if (instance.AppRoot is not FrameworkElement root) return;
 
-                var viewer = FindDescendantScrollViewer(content);
+                var viewer = FindDescendantScrollViewer(root);
                 if (viewer is null) return;
 
                 double step = Math.Sign(delta) * 48.0;

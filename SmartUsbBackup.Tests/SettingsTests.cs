@@ -1,5 +1,6 @@
 using System.IO;
 using System.Reflection;
+using System.Text.Json;
 using SmartUsbBackup.Core;
 using Xunit;
 
@@ -7,6 +8,49 @@ namespace SmartUsbBackup.Tests;
 
 public class SettingsTests
 {
+    private static AppSettings LoadFresh()
+    {
+        var loadMethod = typeof(SettingsStore).GetMethod("Load", BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(loadMethod);
+        return (AppSettings)loadMethod!.Invoke(null, null)!;
+    }
+
+    [Fact]
+    public void Load_DrivesNull_DoesNotLeaveNullList()
+    {
+        using var isolation = new SettingsIsolation();
+
+        Directory.CreateDirectory(SettingsStore.Dir);
+        File.WriteAllText(
+            Path.Combine(SettingsStore.Dir, "settings.json"),
+            "{ \"baseBackupPath\": " + JsonSerializer.Serialize(SettingsStore.DefaultBasePath) +
+            ", \"drives\": null }");
+
+        var loaded = LoadFresh();
+
+        Assert.NotNull(loaded.Drives);
+        Assert.Empty(loaded.Drives);
+    }
+
+    [Fact]
+    public void Load_NullLabelAndSerial_AreNormalized()
+    {
+        using var isolation = new SettingsIsolation();
+
+        Directory.CreateDirectory(SettingsStore.Dir);
+        File.WriteAllText(
+            Path.Combine(SettingsStore.Dir, "settings.json"),
+            "{ \"baseBackupPath\": " + JsonSerializer.Serialize(SettingsStore.DefaultBasePath) +
+            ", \"drives\": [ { \"serial\": null, \"label\": null, \"folderName\": null } ] }");
+
+        var loaded = LoadFresh();
+
+        var drive = Assert.Single(loaded.Drives);
+        Assert.Equal("", drive.Serial);
+        Assert.Equal("", drive.Label);
+        Assert.False(string.IsNullOrWhiteSpace(drive.FolderName));
+    }
+
     [Fact]
     public void AutoCheckForUpdates_DefaultsToTrue()
     {
