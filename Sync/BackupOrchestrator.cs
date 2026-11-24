@@ -196,6 +196,10 @@ public sealed class BackupOrchestrator : IDisposable
     /// </summary>
     internal async Task RunDriveSettingsTest(DriveProfile profile, char letter, IProgress<SyncProgress>? progress, CancellationToken ct = default)
     {
+        // BUG-04: проверяем токен на входе — отменённый тест не должен «протестировать»
+        // флешку по фиктивному результату (и результат не зависит от наличия диска).
+        ct.ThrowIfCancellationRequested();
+
         string driveName = string.IsNullOrWhiteSpace(profile.Label) ? "USB" : profile.Label;
         progress?.Report(new SyncProgress(letter, 0, 100, 0, 0, 0, 100, "", SyncPhase.Testing) { DriveName = driveName });
 
@@ -243,6 +247,9 @@ public sealed class BackupOrchestrator : IDisposable
                             }
                         }
                     }
+                    // BUG-04: отмену (извлечение флешки) не глотаем — иначе тест
+                    // продолжает перебирать файлы и завершается «успешно».
+                    catch (OperationCanceledException) { throw; }
                     catch { /* файл недоступен — пропускаем */ }
 
                     if (fileCount % 500 == 0)
@@ -750,7 +757,12 @@ public sealed class BackupOrchestrator : IDisposable
                 if (ReferenceEquals(session.CurrentCts, sessionCts))
                     session.CurrentCts = null;
                 try { sessionCts.Dispose(); } catch { }
-                if (!SettingsStore.Current.ForceLegacyWatcher)
+                // BUG-01: при включённом live-watch watcher должен жить в простое —
+                // иначе мгновенные обновления ловит только polling (раз в 30 с).
+                // Закрываем только если live-watch выключен или сессия уже отключается.
+                bool effectiveLiveWatch = session.Profile.LiveWatchOverride ?? SettingsStore.Current.LiveWatch;
+                if (!SettingsStore.Current.ForceLegacyWatcher &&
+                    !(effectiveLiveWatch && session.AttachmentState == DriveAttachmentState.Attached))
                     CloseWatcher(session);
                 _syncTasks.TryRemove(key, out _);
                 StateChanged?.Invoke();
@@ -1049,13 +1061,37 @@ public sealed class BackupOrchestrator : IDisposable
         if (session is not null)
         {
             var key = session.Letter.ToString();
+
+            // BUG-03: сначала выключаем профиль и снимаем polling — иначе во время
+            // удаления опрос/live-watch запустит новую синхронизацию в ту же папку,
+            // а активная задача продолжит писать в удаляемое дерево.
+            profile.Enabled = false;
+            if (!ReferenceEquals(session.Profile, profile))
+                session.Profile.Enabled = false;
+
+            // Снимаем только таймер (без .Wait() — не блокируем UI-поток). Текущий
+            // прогон синхронизацию не запустит: профиль уже выключен выше.
+            if (session.PollingTimer is not null)
+            {
+                try { session.PollingTimer.Change(Timeout.Infinite, Timeout.Infinite); } catch { }
+                try { session.PollingTimer.Dispose(); } catch { }
+                session.PollingTimer = null;
+            }
+
             session.CurrentCts?.Cancel();
+            // На случай гонки: отменяем и запись в _fullSyncs (та же задача, но
+            // CurrentCts мог быть уже снят завершающимся finally).
+            if (_fullSyncs.TryGetValue(key, out var activeCts))
+            {
+                try { activeCts.Cancel(); } catch { }
+            }
 
             if (_syncTasks.TryGetValue(key, out var running))
             {
-                // Не ждём вечно: даже «залипшее» чтение с уже вынутой флешки
-                // не должно подвешивать интерфейс.
-                await Task.WhenAny(running, Task.Delay(5000)).ConfigureAwait(false);
+                // Ждём завершения отменённой задачи: копирование проверяет токен перед
+                // каждым файлом, поэтому останавливается быстро. Таймаут — защита от
+                // «залипшего» I/O (вынутая флешка), чтобы не подвешивать интерфейс.
+                await Task.WhenAny(running, Task.Delay(10000)).ConfigureAwait(false);
             }
 
             session.State = SessionState.Idle;

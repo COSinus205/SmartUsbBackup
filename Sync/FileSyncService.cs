@@ -112,9 +112,10 @@ public sealed class FileSyncService
 
         List<FileMeta> sourceFiles;
         long totalBytes;
+        HashSet<string> inaccessibleDirs;
         try
         {
-            sourceFiles = SnapshotFiles(sourceDir, progress);
+            sourceFiles = SnapshotFiles(sourceDir, progress, out inaccessibleDirs);
             totalBytes = 0;
             foreach (var f in sourceFiles)
             {
@@ -278,6 +279,16 @@ public sealed class FileSyncService
                     sourceFiles.Select(s => Path.GetRelativePath(sourceDir, s.Path)),
                     StringComparer.OrdinalIgnoreCase);
 
+                // BUG-02: файлы под каталогами, недоступными при сканировании, отсутствуют
+                // в снимке не из-за удаления. Удалять их из бэкапа нельзя.
+                var protectedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var d in inaccessibleDirs)
+                {
+                    try { protectedDirs.Add(Path.GetRelativePath(sourceDir, d)); }
+                    catch { /* вне sourceDir — не наш случай */ }
+                }
+                int protectedSkipped = 0;
+
                 var sep = Path.DirectorySeparatorChar;
                 var prefix = fullTargetDir.TrimEnd(sep) + sep;
 
@@ -285,6 +296,7 @@ public sealed class FileSyncService
                 foreach (var rel in targetIndex.Keys)
                 {
                     if (expectedOnSource.Contains(rel)) continue;
+                    if (IsUnderAnyDir(rel, protectedDirs)) { protectedSkipped++; continue; }
 
                     string dst;
                     try { dst = Path.GetFullPath(Path.Combine(fullTargetDir, rel)); }
@@ -303,6 +315,9 @@ public sealed class FileSyncService
 
                     toDelete.Add(rel);
                 }
+
+                if (protectedSkipped > 0)
+                    AppLog.Warn($"[MIRROR] Не удалено файлов: {protectedSkipped} — их каталог был недоступен при сканировании");
 
                 int totalToPrune = toDelete.Count;
                 progress?.Report(new SyncProgress('\0', 0, totalToPrune, copied, skipped, 0, totalToPrune, "", SyncPhase.Pruning));
@@ -420,13 +435,25 @@ public sealed class FileSyncService
     //  ВСПОМОГАТЕЛЬНОЕ
     // =====================================================================
 
-    /// <summary>Метаданные всех файлов (рекурсивно). Не открывает содержимое файлов.</summary>
-    private List<FileMeta> SnapshotFiles(string root, IProgress<SyncProgress>? progress = null)
+    /// <summary>
+    /// Метаданные всех файлов (рекурсивно). Не открывает содержимое файлов.
+    /// </summary>
+    /// <param name="inaccessibleDirs">
+    /// Каталоги, которые не удалось перечислить (нет доступа). Их файлы отсутствуют
+    /// в снимке не потому, что удалены, а потому что не прочитаны. Зеркальная чистка
+    /// обязана их не трогать (BUG-02), иначе бэкап теряет данные.
+    /// </param>
+    private List<FileMeta> SnapshotFiles(
+        string root, IProgress<SyncProgress>? progress, out HashSet<string> inaccessibleDirs)
     {
+        inaccessibleDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         var opts = new EnumerationOptions
         {
-            RecurseSubdirectories = true,
-            IgnoreInaccessible = true,
+            // Обход ручной: нужно знать, какие каталоги не открылись. Поэтому
+            // IgnoreInaccessible=false — исключение ловим на уровне каталога.
+            RecurseSubdirectories = false,
+            IgnoreInaccessible = false,
             AttributesToSkip = _skipHiddenSystem
                 ? FileAttributes.Hidden | FileAttributes.System | FileAttributes.ReparsePoint
                 : FileAttributes.ReparsePoint,
@@ -435,34 +462,79 @@ public sealed class FileSyncService
         var result = new List<FileMeta>();
         int count = 0;
         var sw = Stopwatch.StartNew();
-        var rootDir = new DirectoryInfo(root);
-        foreach (var fi in rootDir.EnumerateFiles("*", opts))
+        var pending = new Stack<string>();
+        pending.Push(root);
+
+        while (pending.Count > 0)
         {
-            var path = fi.FullName;
+            string dir = pending.Pop();
             try
             {
-                result.Add(new FileMeta(path, fi.Length, fi.LastWriteTimeUtc));
-            }
-            catch
-            {
-                // Файл мог исчезнуть/быть недоступен во время обхода — сохраняем путь,
-                // размер впоследствии будет вычислен при попытке копирования.
-                result.Add(new FileMeta(path, 0, DateTime.MinValue));
-            }
+                foreach (var entry in new DirectoryInfo(dir).EnumerateFileSystemInfos("*", opts))
+                {
+                    if (entry is DirectoryInfo sub)
+                    {
+                        pending.Push(sub.FullName);
+                        continue;
+                    }
 
-            count++;
-            if (progress is not null && (count % 1024 == 0 || sw.ElapsedMilliseconds >= 250))
+                    var path = entry.FullName;
+                    try
+                    {
+                        var fi = (FileInfo)entry;
+                        result.Add(new FileMeta(path, fi.Length, fi.LastWriteTimeUtc));
+                    }
+                    catch
+                    {
+                        // Файл мог исчезнуть/быть недоступен во время обхода — сохраняем путь,
+                        // размер впоследствии будет вычислен при попытке копирования.
+                        result.Add(new FileMeta(path, 0, DateTime.MinValue));
+                    }
+
+                    count++;
+                    if (progress is not null && (count % 1024 == 0 || sw.ElapsedMilliseconds >= 250))
+                    {
+                        progress.Report(new SyncProgress('\0', count, 0, 0, 0, 0, 0, path, SyncPhase.Scanning));
+                        sw.Restart();
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException)
             {
-                progress.Report(new SyncProgress('\0', count, 0, 0, 0, 0, 0, path, SyncPhase.Scanning));
-                sw.Restart();
+                // Корень не читается вовсе — это не «пустая флешка»: зеркальная чистка
+                // по пустому снимку снесла бы весь бэкап. Пробрасываем наверх.
+                if (string.Equals(dir, root, StringComparison.OrdinalIgnoreCase))
+                    throw;
+
+                inaccessibleDirs.Add(dir);
+                AppLog.Warn($"Каталог недоступен при сканировании, его файлы не будут удалены из бэкапа: {dir}");
             }
         }
+
+        // Флешку вынули во время обхода: DirectoryNotFoundException по подкаталогам
+        // выше не ловится намеренно (IOException летит в SyncAllAsync как ошибка),
+        // но корень всё равно проверяем — пустой снимок вынутой флешки смертелен для зеркала.
+        if (!Directory.Exists(root))
+            throw new DirectoryNotFoundException("Источник недоступен во время сканирования: " + root);
 
         if (progress is not null && count > 0)
         {
             progress.Report(new SyncProgress('\0', count, count, 0, 0, 0, 0, root, SyncPhase.Scanning));
         }
         return result;
+    }
+
+    /// <summary>Относительный путь лежит внутри одного из каталогов (или совпадает).</summary>
+    private static bool IsUnderAnyDir(string relPath, HashSet<string> dirs)
+    {
+        if (dirs.Count == 0) return false;
+        foreach (var d in dirs)
+        {
+            if (relPath.Equals(d, StringComparison.OrdinalIgnoreCase)) return true;
+            if (relPath.StartsWith(d + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>Индекс приёмной папки: относительный путь → (размер, дата UTC).</summary>
