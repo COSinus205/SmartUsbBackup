@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
@@ -606,9 +607,27 @@ public sealed partial class MainWindow : Window
                 XamlRoot = Content.XamlRoot,
             };
 
-            var result = await dlg.ShowAsync();
+            var result = await ShowDialogAsync(dlg);
             if (result == ContentDialogResult.None) return;   // отмена — путь не меняем
             migrate = result == ContentDialogResult.Primary;
+        }
+
+        // Путь хранения меняется для всех профилей без персональной папки:
+        // останавливаем активные копирования, иначе перенос пойдёт параллельно записи.
+        foreach (var session in _orchestrator.ActiveSessions)
+            session.CurrentCts?.Cancel();
+
+        var running = _orchestrator.SyncTasks.Values.ToArray();
+        if (running.Length > 0)
+        {
+            var all = Task.WhenAll(running);
+            var finished = await Task.WhenAny(all, Task.Delay(10000));
+            if (!ReferenceEquals(finished, all))
+            {
+                AppLog.Warn("Смена папки хранения отложена: синхронизация не остановилась за 10 с");
+                TxtGlobalStatus.Text = "Не удалось остановить синхронизацию. Повторите позже.";
+                return;
+            }
         }
 
         SettingsStore.Current.BaseBackupPath = canonical;
@@ -642,6 +661,11 @@ public sealed partial class MainWindow : Window
             TxtGlobalStatus.Text = $"Перенесено копий: {moved}.";
             AppLog.Info($"Перенос бэкапов завершён: {moved} из {movable.Count}");
         }
+
+        // После смены пути возобновляем включённые флешки уже в новой папке.
+        foreach (var session in _orchestrator.ActiveSessions)
+            if (session.Profile.Enabled)
+                _orchestrator.SyncOne(session.Profile);
 
         RefreshList();
     }
@@ -766,7 +790,7 @@ public sealed partial class MainWindow : Window
         });
 
         dialog.Content = new ScrollViewer { Content = panel, MaxHeight = 480 };
-        await dialog.ShowAsync();
+        await ShowDialogAsync(dialog);
 
         if (chosenPath is not null)
             await ChangeGlobalBackupPathAsync(chosenPath);
@@ -919,7 +943,7 @@ public sealed partial class MainWindow : Window
         stack.Children.Add(statusText);
 
         dialog.Content = new ScrollViewer { Content = stack, MaxHeight = 480 };
-        await dialog.ShowAsync();
+        await ShowDialogAsync(dialog);
 
         try
         {
@@ -1391,6 +1415,19 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
+            // Если открыт другой диалог (настройки и т.п.), второй ContentDialog
+            // показать нельзя: сообщаем в трей/статус и не теряем проверку молча.
+            if (Volatile.Read(ref _openDialogs) > 0)
+            {
+                TxtGlobalStatus.Text = $"Доступно обновление {info.Version}. Закройте открытый диалог, чтобы установить.";
+                SafeNotify("Smart USB Backup",
+                    $"Доступно обновление {info.Version}. Закройте открытый диалог, чтобы установить.");
+                // Не считаем проверку завершённой: предложим обновление позже.
+                SettingsStore.Current.LastUpdateCheck = last;
+                SettingsStore.Save();
+                return;
+            }
+
             // Мажорные обновления (например 4.x -> 5.x) не скачиваем автоматически —
             // возможные breaking changes. Пользователь качает установщик вручную.
             if (UpdateService.IsMajorUpdate(current, info.Version))
@@ -1405,7 +1442,7 @@ public sealed partial class MainWindow : Window
                     XamlRoot = Content.XamlRoot,
                 };
 
-                if (await majorDlg.ShowAsync() == ContentDialogResult.Primary &&
+                if (await ShowDialogAsync(majorDlg) == ContentDialogResult.Primary &&
                     !string.IsNullOrWhiteSpace(info.HtmlUrl))
                 {
                     try
@@ -1439,7 +1476,7 @@ public sealed partial class MainWindow : Window
                 XamlRoot = Content.XamlRoot,
             };
 
-            if (await dlg.ShowAsync() != ContentDialogResult.Primary)
+            if (await ShowDialogAsync(dlg) != ContentDialogResult.Primary)
                 return;
 
             // Отдельный диалог прогресса: предыдущий уже закрыт ShowAsync(),
@@ -1598,6 +1635,25 @@ public sealed partial class MainWindow : Window
     //  ДИАЛОГИ (MessageBox → ContentDialog)
     // =====================================================================
 
+    private int _openDialogs;
+
+    /// <summary>
+    /// Показывает ContentDialog и учитывает, что он открыт: фоновые сценарии
+    /// (автообновление) не должны пытаться открыть второй диалог одновременно.
+    /// </summary>
+    private async Task<ContentDialogResult> ShowDialogAsync(ContentDialog dialog)
+    {
+        Interlocked.Increment(ref _openDialogs);
+        try
+        {
+            return await dialog.ShowAsync();
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _openDialogs);
+        }
+    }
+
     private ContentDialog MakeDialog(string title, string message, string primary, string close)
         => new()
         {
@@ -1613,7 +1669,7 @@ public sealed partial class MainWindow : Window
     {
         try
         {
-            return await MakeDialog(title, message, primary, "Отмена").ShowAsync()
+            return await ShowDialogAsync(MakeDialog(title, message, primary, "Отмена"))
                    == ContentDialogResult.Primary;
         }
         catch (Exception ex)
@@ -1627,14 +1683,14 @@ public sealed partial class MainWindow : Window
     {
         try
         {
-            await new ContentDialog
+            await ShowDialogAsync(new ContentDialog
             {
                 Title = title,
                 Content = message,
                 CloseButtonText = "ОК",
                 DefaultButton = ContentDialogButton.Close,
                 XamlRoot = Content.XamlRoot,
-            }.ShowAsync();
+            });
         }
         catch (Exception ex)
         {

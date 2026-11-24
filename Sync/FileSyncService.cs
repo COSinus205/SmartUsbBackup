@@ -119,13 +119,16 @@ public sealed class FileSyncService
                     }
                 }
             }
-            catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException)
+            catch (Exception ex) when (ex is UnauthorizedAccessException
+                                        or System.Security.SecurityException
+                                        or IOException)
             {
                 // Корень не читается вовсе — это не «пустая флешка»: чистка по пустому
                 // снимку снесла бы весь бэкап. Пробрасываем наверх.
                 if (string.Equals(dir, root, StringComparison.OrdinalIgnoreCase))
                     throw;
 
+                // Каталог исчез/стал недоступен во время обхода: его файлы не удаляем.
                 inaccessibleDirs.Add(dir);
                 AppLog.Warn($"Каталог недоступен при сканировании, его файлы не будут удалены из бэкапа: {dir}");
             }

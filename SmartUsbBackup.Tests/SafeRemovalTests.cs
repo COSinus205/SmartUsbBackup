@@ -130,13 +130,6 @@ public sealed class SafeRemovalStateTests
     }
 
     [Fact]
-    public void DriveLetterFromUnitMask_MultipleBits()
-    {
-        var letters = BackupOrchestrator.DriveLetterFromUnitMask(0b101u).ToArray();
-        Assert.Equal(new[] { 'A', 'C' }, letters);
-    }
-
-    [Fact]
     public void QueryRemove_DuringSync_WaitsAndReturnsTrue()
     {
         var orchestrator = new BackupOrchestrator();
