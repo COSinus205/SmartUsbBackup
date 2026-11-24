@@ -5,7 +5,7 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 проект придерживается [Semantic Versioning](https://semver.org/lang/ru/).
 
-## [Unreleased]
+## [5.0.0] - 2026-11-24
 
 ### Changed
 - Вкладки удалены: главное окно — одна страница со списком флешек.

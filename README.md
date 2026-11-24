@@ -1,4 +1,4 @@
-﻿# Smart USB Backup 4.3.2 (WinUI 3)
+﻿# Smart USB Backup 5.0.0 (WinUI 3)
 
 ![CI](https://github.com/COSinus205/SmartUsbBackup/actions/workflows/ci.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
@@ -7,17 +7,17 @@
 
 Современное приложение для зеркального резервного копирования USB-флешек. В простое приложение не держит ни дескрипторов на флешке, ни фоновых watcher'ов: копирование запускается при подключении флешки или по кнопке, поэтому «Безопасное извлечение» в Windows работает без «Устройство занято».
 
-> **Версия 4.3.2** — исправления и небольшие улучшения: безопасная проверка путей хранения (включая персональные папки профилей), корректное сравнение версий при обновлении, обязательный SHA-256 для автообновления, поддержка внешних USB HDD/SSD, перенос существующих копий при смене папки и более информативный деинсталлятор. Формат `settings.json` совместим с 4.3.1.
+> **Версия 5.0.0** — упрощение и переосмысление приложения: только зеркальное копирование, запуск при подключении флешки и по кнопке, без CRC, live-watch, polling и тюнинга буфера. Интерфейс без вкладок: общие настройки и настройки флешки открываются диалогами. Скрытые и системные файлы не копируются и больше не удаляются из существующих копий. Новые флешки добавляются выключенными. Старый `settings.json` читается совместимо; удалённые настройки игнорируются.
 
-> **Последний релиз — 4.3.2.**
+> **Последний релиз — 5.0.0.** Мажорная версия: поведение изменилось осознанно (см. `CHANGELOG.md`).
 
 <div align="center">
-  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.3.2">
-    <img src="https://img.shields.io/badge/Download%20installer-4.3.2-blue?style=for-the-badge" alt="Download Smart USB Backup 4.3.2 installer">
+  <a href="https://github.com/COSinus205/SmartUsbBackup/releases/tag/v5.0.0">
+    <img src="https://img.shields.io/badge/Download%20installer-5.0.0-blue?style=for-the-badge" alt="Download Smart USB Backup 5.0.0 installer">
   </a>
 </div>
 
-> Latest installer: [SmartUsbBackup-Setup-4.3.2.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v4.3.2)
+> Latest installer: [SmartUsbBackup-Setup-5.0.0.exe](https://github.com/COSinus205/SmartUsbBackup/releases/tag/v5.0.0)
 
 ## Основные возможности
 
@@ -53,7 +53,7 @@ dotnet build -c Release
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\SmartUsbBackup.iss
 ```
 
-Результат: `installer/dist/SmartUsbBackup-Setup-4.3.2.exe`.
+Результат: `installer/dist/SmartUsbBackup-Setup-5.0.0.exe`.
 
 Установка per-user, без прав администратора. При удалении предлагается выбрать, какие копии флешек удалить (в списке — полные пути, включая персональные папки профилей).
 
@@ -109,7 +109,7 @@ dotnet build -c Release
 | `Properties/AssemblyInfo.cs` | `InternalsVisibleTo("SmartUsbBackup.Tests")`. |
 | `SmartUsbBackup.Tests/` | xUnit-тесты: 84 тестовых случая. |
 | `installer/SmartUsbBackup.iss` | Скрипт Inno Setup (per-user install, деинсталляция, Pascal Script). |
-| `installer/dist/SmartUsbBackup-Setup-4.3.2.exe` | Собранный установщик (релиз). |
+| `installer/dist/SmartUsbBackup-Setup-5.0.0.exe` | Собранный установщик (релиз). |
 | `CHANGELOG.md` | История изменений. |
 
 > Тестовый харнесс `ejecttest` **не входит в репозиторий**; для локальных копий действуют правила `.gitignore` (`tools/ejecttest/`, `ejecttest/`, `*.ejecttest.*`).
