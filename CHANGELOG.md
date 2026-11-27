@@ -5,7 +5,7 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 проект придерживается [Semantic Versioning](https://semver.org/lang/ru/).
 
-## [Unreleased]
+## [5.0.1] - 2026-11-27
 
 ### Fixed
 - Перенос бэкапа в папку внутри самого бэкапа больше не удаляет копию:

@@ -1,4 +1,4 @@
-# Список багов — Smart USB Backup 5.0.0
+# Список багов — Smart USB Backup 5.0.1
 
 - Репозиторий: `C:\Projects\SmartUsbBackup`, ветка `main`.
 - Метод: чтение исходников (C#/XAML/.iss/CI) + прогон тестов. Живой прогон —
