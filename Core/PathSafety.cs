@@ -40,10 +40,6 @@ public static class PathSafety
         return fullCandidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>Строго внутри каталога (равенство запрещено).</summary>
-    public static bool IsInsideDirectory(string basePath, string candidatePath)
-        => IsSafeSubPath(basePath, candidatePath);
-
     /// <summary>Совпадает с каталогом или находится внутри него.</summary>
     public static bool IsInsideOrEqual(string basePath, string candidatePath)
     {

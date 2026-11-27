@@ -37,10 +37,6 @@ public sealed class DriveProfile
     [JsonIgnore]
     public char DriveLetter { get; set; } = '\0';
 
-    /// <summary>Когда флешка впервые была видна приложению.</summary>
-    [JsonPropertyName("firstSeen")]
-    public DateTime FirstSeen { get; set; } = DateTime.Now;
-
     /// <summary>
     /// Полный путь к папке бэкапа (внутри базовой папки).
     /// Персональный путь перепроверяется на безопасность при каждом обращении:
@@ -79,14 +75,6 @@ public sealed class AppSettings
     /// <summary>Базовая папка для бэкапов. По умолчанию — %LocalAppData%\SmartUsbBackup\Backups.</summary>
     [JsonPropertyName("baseBackupPath")]
     public string BaseBackupPath { get; set; } = "";
-
-    /// <summary>Автозапуск вместе с Windows (HKCU\...\Run — не требует прав администратора).</summary>
-    [JsonPropertyName("runAtStartup")]
-    public bool RunAtStartup { get; set; } = false;
-
-    /// <summary>Скрыть окно на старте при автозапуске.</summary>
-    [JsonPropertyName("startMinimized")]
-    public bool StartMinimized { get; set; } = false;
 
     /// <summary>Список известных флешек.</summary>
     [JsonPropertyName("drives")]

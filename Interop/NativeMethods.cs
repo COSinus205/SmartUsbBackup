@@ -165,9 +165,6 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
-    [DllImport("user32.dll")]
-    public static extern bool IsIconic(IntPtr hWnd);
-
     private const uint WM_APP_RESTORE = 0x8001; // WM_APP + 1 — наша приватная команда
 
     private const int HWND_BROADCAST = 0xFFFF;

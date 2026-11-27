@@ -39,11 +39,6 @@ public sealed record SyncProgress(
 {
     /// <summary>Отображаемое имя флешки («Метка [серийник]»).</summary>
     public string DriveName { get; init; } = "";
-
-    /// <summary>Процент выполнения по байтам (0..100).</summary>
-    public int Percent => TotalBytes > 0
-        ? (int)Math.Clamp(BytesDone * 100.0 / TotalBytes, 0, 100)
-        : (TotalFiles > 0 && ProcessedCount >= TotalFiles ? 100 : 0);
 }
 
 /// <summary>Итог одного прогона синхронизации.</summary>

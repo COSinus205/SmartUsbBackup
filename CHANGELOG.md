@@ -59,6 +59,12 @@
 - `%` в пути установщика/приложения экранируется для `cmd`, поэтому папка
   вида `100%` больше не ломает автообновление.
 
+### Removed
+- Неиспользуемые поля `settings.json`: `runAtStartup`, `startMinimized`,
+  `firstSeen`. Старые файлы читаются, неизвестные поля игнорируются.
+- Мёртвый код: `ComputeBackupState`, `FindNamedDescendant`, `IsIconic`,
+  `SyncProgress.Percent`, `PathSafety.IsInsideDirectory`.
+
 ## [5.0.0] - 2026-11-24
 
 ### Changed

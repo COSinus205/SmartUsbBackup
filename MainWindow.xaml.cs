@@ -277,21 +277,6 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private static DependencyObject? FindNamedDescendant(DependencyObject root, string name)
-    {
-        if (root is FrameworkElement fe && fe.Name == name)
-            return root;
-
-        int count = VisualTreeHelper.GetChildrenCount(root);
-        for (int i = 0; i < count; i++)
-        {
-            var child = VisualTreeHelper.GetChild(root, i);
-            var found = FindNamedDescendant(child, name);
-            if (found is not null) return found;
-        }
-        return null;
-    }
-
     /// <summary>Вторая копия приложения (или пользователь) просит показать окно.</summary>
     private void RestoreWindow()
     {
@@ -865,8 +850,6 @@ public sealed partial class MainWindow : Window
             else
                 key?.DeleteValue("SmartUsbBackup", throwOnMissingValue: false);
 
-            SettingsStore.Current.RunAtStartup = enable;
-            SettingsStore.Save();
             AppLog.Info($"Автозапуск с Windows: {enable}");
         }
         catch (Exception ex)
@@ -1308,18 +1291,6 @@ public sealed partial class MainWindow : Window
             SessionState.Error => "Ошибка: " + session.LastResult,
             _ => "Синхронизировано",
         };
-    }
-
-    private string ComputeBackupState(DriveProfile profile)
-    {
-        if (!Directory.Exists(profile.BackupPath)) return "Нет сохранения";
-
-        bool syncing = _orchestrator.ActiveSessions.Any(s =>
-            (ReferenceEquals(s.Profile, profile) ||
-             string.Equals(s.Profile.Serial, profile.Serial, StringComparison.OrdinalIgnoreCase))
-            && s.State == SessionState.Syncing);
-
-        return syncing ? "Синхронизируется" : "Есть сохранение";
     }
 
     /// <summary>

@@ -76,13 +76,13 @@ dotnet build -c Release
 | Настройка | По умолчанию | Назначение |
 |---|---|---|
 | `BaseBackupPath` | `%LocalAppData%\SmartUsbBackup\Backups` | Папка хранения копий. |
-| `RunAtStartup` | `false` | Запускать приложение с Windows. |
-| `StartMinimized` | `false` | Скрывать окно при автозапуске. |
-| `AutoCheckForUpdates` | `true` | Автопроверка обновлений раз в сутки. |
+| `AutoCheckForUpdates` | `true` | Автопроверка обновлений (не чаще раза в сутки). |
 | `LastUpdateCheck` | `DateTime.MinValue` | Время последней проверки обновлений. |
-| `Drives` | `[]` | Профили флешек: `Serial`, `Label`, `FolderName`, `Enabled`, `FirstSeen`, `BaseBackupPathOverride`. |
+| `Drives` | `[]` | Профили флешек: `Serial`, `Label`, `FolderName`, `Enabled`, `BaseBackupPathOverride`. |
 
-Новые флешки добавляются с `Enabled = false`; включить резервирование можно в строке таблицы или на вкладке флешки.
+Автозапуск с Windows хранится не в JSON, а в `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+
+Новые флешки добавляются с `Enabled = false`; включить резервирование можно в строке таблицы или в настройках флешки.
 
 ## Структура проекта
 
