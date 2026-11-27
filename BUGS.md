@@ -68,6 +68,36 @@
   и ему адресуется сообщение напрямую. Проверено вживую: `-hidden`, затем
   второй запуск — окно становится видимым, экземпляр остаётся один.
 
+## Открытые находки 27.11.2026 (не исправлены)
+
+Найдены при ревью 5.0.0, воспроизведением не подтверждались. Оставлены на
+следующий проход.
+
+- `MainWindow.RefreshList` + `FileSyncService.SyncAllAsync`: прогон,
+  завершившийся с `SyncResult.Error` (например, ошибка сканирования), не шлёт
+  фазу `Error`. `SyncFinished` не чистит `_syncingDrives` — колонка
+  «Сохранение» может остаться «Синхронизируется».
+- `MainWindow.OnDriveQueryRemoveFailedUi` + `BackupOrchestrator.StartFullSync`:
+  после `DBT_DEVICEQUERYREMOVEFAILED` старый отменённый прогон в своём `finally`
+  выставляет `State=Idle`/`LastResult="отменено"` и шлёт `Cancelled` уже поверх
+  нового прогона. Нужен номер поколения сессии.
+- `FileSyncService.SnapshotFiles`, `BuildTargetIndex`, `CleanupEmptyDirs` не
+  принимают `CancellationToken`: скан/индексация не отменяются, безопасное
+  извлечение ждёт 1 с и получает отказ.
+- `PathSafety.CanonicalizeBase` запрещает только точные `Windows` /
+  `Program Files`; `C:\Windows\Temp`, `C:\Program Files\Foo` проходят, хотя
+  диалог выбора папки обещает обратное.
+- `SettingsStore.Save`: подчищаются только 16 «хвостов» `BackupRootN`; при
+  большем числе баз в реестре остаются старые пути для деинсталлятора.
+- `SettingsStore.Load`: `"drives": [null]` даёт NRE в `foreach`, внешний
+  `catch` сбрасывает все настройки в дефолт (профили теряются при следующем
+  `Save`).
+- `UsbDeviceWatcher.QueryDrive(retry: 3, delayMs: 200)` даёт ~0,6 с на
+  монтирование; медленный USB HDD/SSD может быть проигнорирован до
+  переподключения.
+- `NativeTrayIcon.PromoteIconToTrayAsync` работает в фоне без синхронизации с
+  `Dispose`; после `DestroyWindow` может вызвать `Shell_NotifyIcon`.
+
 ## P1
 
 ### BUG-01. Live-watch фактически не работает в простое
