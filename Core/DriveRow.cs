@@ -52,6 +52,16 @@ public sealed class DriveRow : INotifyPropertyChanged
     // ------------------------------------------------------------------
     public void RefreshState(string newState) => State = newState;
 
+    /// <summary>
+    /// Пересчитать вычисляемые свойства после смены пути хранения или метки
+    /// профиля: без уведомления x:Bind не обновит колонку «Путь к папке».
+    /// </summary>
+    public void RefreshComputed()
+    {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Name)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(BackupPath)));
+    }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 
     private void Set<T>(ref T field, T value, [CallerMemberName] string? name = null)

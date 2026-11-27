@@ -330,9 +330,30 @@ public sealed partial class MainWindow : Window
             {
                 session.LastSuccessfulSyncUtc = DateTime.Now;
             }
+
+            // Прогон мог завершиться результатом с ошибкой (например, сбой
+            // сканирования), не прислав фазу Error. Снимаем «Синхронизируется»
+            // здесь, иначе колонка «Сохранение» зависает до переподключения.
+            lock (_driveStateLock)
+            {
+                _syncingDrives.Remove(session.Profile);
+            }
+
             // После прогона папка бэкапа точно изменилась — кэш presence устарел.
             _backupPresence.Invalidate(session.Profile.BackupPath);
-            _dq.TryEnqueue(RefreshList);
+
+            _dq.TryEnqueue(() =>
+            {
+                RefreshList();
+
+                if (result.Error is not null &&
+                    !_orchestrator.ActiveSessions.Any(s => s.State == SessionState.Syncing))
+                {
+                    GlobalProgressBar.IsIndeterminate = false;
+                    GlobalProgressBar.Value = 0;
+                    TxtGlobalStatus.Text = "Ошибка синхронизации: " + result.Error;
+                }
+            });
         };
     }
 
@@ -1192,6 +1213,7 @@ public sealed partial class MainWindow : Window
 
 
             row.Enabled = profile.Enabled;
+            row.RefreshComputed();
 
             // Состояние строки: выключено / не подключена / резервирование / ошибка.
             row.RefreshState(ComputeState(profile));

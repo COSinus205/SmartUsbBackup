@@ -232,6 +232,7 @@ public sealed class BackupOrchestrator : IDisposable
             return;
         }
 
+        int generation;
         lock (_fullSyncs)
         {
             if (_fullSyncs.TryGetValue(key, out var existingCts))
@@ -252,6 +253,9 @@ public sealed class BackupOrchestrator : IDisposable
             var cts = new CancellationTokenSource();
             session.CurrentCts = cts;
             _fullSyncs[key] = cts;
+            // Новый прогон: всё, что старая (отменённая) задача ещё допишет,
+            // больше не должно менять состояние сессии и прогресс.
+            generation = session.BeginSyncGeneration();
         }
 
         var sessionCts = session.CurrentCts!;
@@ -265,7 +269,11 @@ public sealed class BackupOrchestrator : IDisposable
         AppLog.Info($"Полная синхронизация {key} запущена: {driveName}");
         ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Scanning) { DriveName = driveName });
 
-        var progress = new Progress<SyncProgress>(p => ProgressChanged?.Invoke(session, p with { DriveName = driveName }));
+        var progress = new Progress<SyncProgress>(p =>
+        {
+            if (session.IsCurrentGeneration(generation))
+                ProgressChanged?.Invoke(session, p with { DriveName = driveName });
+        });
 
         // Запись в _syncTasks делаем ДО запуска работы: иначе очень быстрый
         // прогон успевает завершиться и его finally удаляет ещё не добавленную
@@ -280,23 +288,32 @@ public sealed class BackupOrchestrator : IDisposable
                 var result = await session.FsSync.SyncAllAsync(
                     session.SourceRoot, session.BackupPath, progress, sessionCts.Token);
 
-                session.State = result.Error is null ? SessionState.Idle : SessionState.Error;
-                session.LastResult = result.Error ?? $"копий {result.Copied}, удалено {result.Deleted}, пропущено {result.Skipped}";
-                SyncFinished?.Invoke(session, result);
+                if (session.IsCurrentGeneration(generation))
+                {
+                    session.State = result.Error is null ? SessionState.Idle : SessionState.Error;
+                    session.LastResult = result.Error ?? $"копий {result.Copied}, удалено {result.Deleted}, пропущено {result.Skipped}";
+                    SyncFinished?.Invoke(session, result);
+                }
             }
             catch (OperationCanceledException)
             {
                 AppLog.Warn($"Полная синхронизация {key} отменена");
-                session.State = SessionState.Idle;
-                session.LastResult = "отменено";
-                ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Cancelled) { DriveName = driveName });
+                if (session.IsCurrentGeneration(generation))
+                {
+                    session.State = SessionState.Idle;
+                    session.LastResult = "отменено";
+                    ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Cancelled) { DriveName = driveName });
+                }
             }
             catch (Exception ex)
             {
-                session.State = SessionState.Error;
-                session.LastResult = "ошибка: " + ex.Message;
                 AppLog.Error(ex, $"Полная синхронизация {session.SourceRoot} сорвалась");
-                ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Error) { DriveName = driveName });
+                if (session.IsCurrentGeneration(generation))
+                {
+                    session.State = SessionState.Error;
+                    session.LastResult = "ошибка: " + ex.Message;
+                    ProgressChanged?.Invoke(session, new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Error) { DriveName = driveName });
+                }
             }
             finally
             {
@@ -651,6 +668,19 @@ public sealed class ConnectedSession : IDisposable
 
     public volatile bool DetachRequested;
     public DateTime LastSuccessfulSyncUtc { get; set; } = DateTime.MinValue;
+
+    /// <summary>Номер текущего прогона синхронизации.</summary>
+    private int _syncGeneration;
+
+    /// <summary>
+    /// Начать новый прогон и получить его номер. Старые задачи сравнивают свой
+    /// номер с текущим и не меняют состояние, если уже стартовал новый прогон.
+    /// </summary>
+    internal int BeginSyncGeneration() => Interlocked.Increment(ref _syncGeneration);
+
+    /// <summary>Прогон всё ещё актуален (не заменён новым).</summary>
+    internal bool IsCurrentGeneration(int generation) =>
+        Volatile.Read(ref _syncGeneration) == generation;
 
     /// <summary>Корень флешки, например "D:\".</summary>
     public string SourceRoot => $@"{Letter}:\";

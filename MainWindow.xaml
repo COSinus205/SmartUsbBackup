@@ -236,10 +236,10 @@
 
                   <TextBlock
                       Grid.Column="4"
-                      Text="{x:Bind BackupPath}"
+                      Text="{x:Bind BackupPath, Mode=OneWay}"
                       TextTrimming="CharacterEllipsis"
                       VerticalAlignment="Center"
-                      ToolTipService.ToolTip="{x:Bind BackupPath}" />
+                      ToolTipService.ToolTip="{x:Bind BackupPath, Mode=OneWay}" />
 
                   <Button
                       Grid.Column="5"

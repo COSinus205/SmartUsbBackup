@@ -181,6 +181,20 @@ public sealed class SafeRemovalStateTests
     }
 
     [Fact]
+    public void SyncGeneration_NewRunInvalidatesPrevious()
+    {
+        var session = NewSession();
+
+        int first = session.BeginSyncGeneration();
+        Assert.True(session.IsCurrentGeneration(first));
+
+        int second = session.BeginSyncGeneration();
+        Assert.False(session.IsCurrentGeneration(first));
+        Assert.True(session.IsCurrentGeneration(second));
+        Assert.NotEqual(first, second);
+    }
+
+    [Fact]
     public async Task SyncAllAsync_Cancellation_DoesNotHang()
     {
         var root = Path.Combine(Path.GetTempPath(), "smartusb_test_" + Guid.NewGuid().ToString("N"));
