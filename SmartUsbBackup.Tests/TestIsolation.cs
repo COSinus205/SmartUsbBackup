@@ -4,6 +4,10 @@ using System.IO;
 using Microsoft.Win32;
 using SmartUsbBackup.Core;
 
+// SettingsStore — статическое глобальное состояние (файл + реестр), поэтому
+// тестовые классы не должны менять его параллельно.
+[assembly: Xunit.CollectionBehavior(DisableTestParallelization = true)]
+
 namespace SmartUsbBackup.Tests;
 
 /// <summary>

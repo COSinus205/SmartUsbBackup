@@ -25,6 +25,14 @@ public sealed class BackupOrchestrator : IDisposable
     // дождаться остановки копирования, а не удалять папку «из-под» активной записи.
     private readonly ConcurrentDictionary<string, Task> _syncTasks = new(StringComparer.OrdinalIgnoreCase);
 
+    // Сколько REMOVECOMPLETE относится к уже заменённой сессии (быстрое
+    // переподключение с той же буквой). Не даёт старому событию снять новую.
+    private readonly ConcurrentDictionary<string, (int Count, DateTime AtUtc)> _staleRemovals =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Сколько живёт «кредит» на игнор устаревшего REMOVECOMPLETE.</summary>
+    private static readonly TimeSpan StaleRemovalWindow = TimeSpan.FromSeconds(10);
+
     /// <summary>Событие прогресса для UI (маршалинг в поток UI — задача окна).</summary>
     public event Action<ConnectedSession, SyncProgress>? ProgressChanged;
 
@@ -57,6 +65,8 @@ public sealed class BackupOrchestrator : IDisposable
         // Заменяем возможную старую сессию для этой же буквы.
         if (_sessions.TryGetValue(key, out var previous))
         {
+            bool sameDrive = string.Equals(previous.Profile.Serial, profile.Serial, StringComparison.OrdinalIgnoreCase);
+
             AppLog.Warn($"Подключение {key}: заменяю незакрытую сессию прошлого подключения");
             if (_fullSyncs.TryRemove(key, out var previousCts))
             {
@@ -64,6 +74,16 @@ public sealed class BackupOrchestrator : IDisposable
             }
             _syncTasks.TryRemove(key, out _);
             try { previous.Dispose(); } catch { }
+
+            // Другая флешка на той же букве: её REMOVECOMPLETE ещё может прийти
+            // позже. Разрешаем проигнорировать одно такое событие.
+            if (!sameDrive)
+            {
+                _staleRemovals.AddOrUpdate(
+                    key,
+                    _ => (1, DateTime.UtcNow),
+                    (_, old) => (old.Count + 1, DateTime.UtcNow));
+            }
         }
 
         _sessions[key] = session;
@@ -102,7 +122,17 @@ public sealed class BackupOrchestrator : IDisposable
     public void OnDriveRemoveComplete(char letter)
     {
         var key = letter.ToString();
-        if (!_sessions.TryRemove(key, out var session)) return;
+        if (!_sessions.TryGetValue(key, out var session))
+            return;
+
+        // Пришло событие от предыдущей флешки с этой же буквой — новую не трогаем.
+        if (TryConsumeStaleRemoval(key))
+            return;
+
+        // Удаляем только ту сессию, которую проверили: за время между TryGetValue
+        // и удалением её могла заменить новая флешка.
+        if (!_sessions.TryRemove(new KeyValuePair<string, ConnectedSession>(key, session)))
+            return;
 
         if (_fullSyncs.TryRemove(key, out var cts))
         {
@@ -124,6 +154,32 @@ public sealed class BackupOrchestrator : IDisposable
 
         StateChanged?.Invoke();
         AppLog.Info($"Флешка отключена: {letter}:");
+    }
+
+    /// <summary>
+    /// Игнорирует один устаревший REMOVECOMPLETE, оставшийся от заменённой
+    /// сессии (быстрое переподключение с той же буквой). Кредит истекает через
+    /// <see cref="StaleRemovalWindow"/>, чтобы потерянное событие не блокировало
+    /// удаление новой флешки навсегда.
+    /// </summary>
+    private bool TryConsumeStaleRemoval(string key)
+    {
+        if (!_staleRemovals.TryGetValue(key, out var stale))
+            return false;
+
+        if (DateTime.UtcNow - stale.AtUtc > StaleRemovalWindow)
+        {
+            _staleRemovals.TryRemove(key, out _);
+            return false;
+        }
+
+        if (stale.Count <= 1)
+            _staleRemovals.TryRemove(key, out _);
+        else
+            _staleRemovals[key] = (stale.Count - 1, stale.AtUtc);
+
+        AppLog.Warn($"REMOVECOMPLETE {key}: относится к заменённой сессии — пропуск");
+        return true;
     }
 
     /// <summary>
@@ -501,12 +557,14 @@ public sealed class BackupOrchestrator : IDisposable
             }
 
             bool stopped = true;
-            if (_syncTasks.TryGetValue(key, out var running))
+            Task? running = null;
+            if (_syncTasks.TryGetValue(key, out var active))
             {
+                running = active;
                 // Копирование проверяет токен перед каждым файлом, поэтому
                 // останавливается быстро. Таймаут — защита от «залипшего» I/O.
-                var finished = await Task.WhenAny(running, Task.Delay(10000)).ConfigureAwait(false);
-                stopped = ReferenceEquals(finished, running);
+                var finished = await Task.WhenAny(active, Task.Delay(10000)).ConfigureAwait(false);
+                stopped = ReferenceEquals(finished, active);
             }
 
             if (!stopped)
@@ -520,6 +578,12 @@ public sealed class BackupOrchestrator : IDisposable
                     session.Profile.Enabled = wasEnabled;
                 SettingsStore.Save();
                 StateChanged?.Invoke();
+
+                // Профиль снова включён, но копирование было отменено. Возобновим
+                // его, когда «залипшая» задача всё-таки завершится.
+                if (wasEnabled && running is not null)
+                    _ = RetrySyncWhenStoppedAsync(session, running);
+
                 return;
             }
 
@@ -602,6 +666,37 @@ public sealed class BackupOrchestrator : IDisposable
         profile.Enabled = false;
         SettingsStore.Save();
         StateChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// После отложенного удаления бэкапа возобновляет копирование, когда
+    /// «залипшая» задача завершится (или сдаётся через 5 минут). Проверяет,
+    /// что сессия всё ещё та же и флешка подключена.
+    /// </summary>
+    private async Task RetrySyncWhenStoppedAsync(ConnectedSession session, Task previous)
+    {
+        try
+        {
+            var finished = await Task.WhenAny(previous, Task.Delay(TimeSpan.FromMinutes(5))).ConfigureAwait(false);
+            if (!ReferenceEquals(finished, previous))
+            {
+                AppLog.Warn($"Синхронизация {session.Letter}: не завершилась за 5 минут после отложенного удаления — автоповтор отменён");
+                return;
+            }
+
+            var key = session.Letter.ToString();
+            if (!_sessions.TryGetValue(key, out var current) || !ReferenceEquals(current, session))
+                return;
+            if (!session.Profile.Enabled || !Directory.Exists(session.SourceRoot))
+                return;
+
+            AppLog.Info($"Синхронизация {session.Letter}: возобновление после отложенного удаления бэкапа");
+            StartFullSync(session);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, $"Не удалось возобновить синхронизацию {session.Letter} после отложенного удаления");
+        }
     }
 
     public async Task DisposeAsync()
