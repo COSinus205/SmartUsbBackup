@@ -545,6 +545,13 @@ public static class UpdateService
     public static bool VerifyAuthenticode(string filePath) => WinTrust.Verify(filePath);
 
     /// <summary>
+    /// Экранирует `%` для строки, передаваемой `cmd.exe /c`: иначе папка вида
+    /// `100%` раскрывается как переменная и установщик/перезапуск не срабатывает.
+    /// `^%` работает и внутри двойных кавычек.
+    /// </summary>
+    internal static string EscapeForCmd(string value) => value.Replace("%", "^%");
+
+    /// <summary>
     /// Внутренняя механика запуска установщика (через cmd с задержкой).
     /// Используется и в продакшен-пути (после WinTrust), и во временных тестах.
     /// <paramref name="restartHidden"/> — перезапустить приложение скрыто (как оно
@@ -561,7 +568,7 @@ public static class UpdateService
             {
                 var exe = Environment.ProcessPath;
                 if (!string.IsNullOrWhiteSpace(exe) && File.Exists(exe))
-                    restart = " & start \"\" \"" + exe + "\"" + (restartHidden ? " -hidden" : string.Empty);
+                    restart = " & start \"\" \"" + EscapeForCmd(exe) + "\"" + (restartHidden ? " -hidden" : string.Empty);
             }
             catch (Exception ex)
             {
@@ -573,7 +580,7 @@ public static class UpdateService
             var psi = new ProcessStartInfo
             {
                 FileName = "cmd.exe",
-                Arguments = $"/c timeout 2 >nul & \"{installerPath}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART{restart}",
+                Arguments = $"/c timeout 2 >nul & \"{EscapeForCmd(installerPath)}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART{restart}",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden

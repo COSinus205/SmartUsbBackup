@@ -78,6 +78,20 @@ internal static class NativeMethods
         public string dbcc_name;
     }
 
+    /// <summary>
+    /// Заголовок того же пакета без строки имени. Строка переменной длины, поэтому
+    /// читать её нужно по фактическому <c>dbcc_size</c>, а не по фиксированному
+    /// SizeConst (иначе маршалинг уходит за границу буфера).
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DEV_BROADCAST_DEVICEINTERFACE_HEADER
+    {
+        public int dbcc_size;
+        public int dbcc_devicetype;
+        public int dbcc_reserved;
+        public Guid dbcc_classguid;
+    }
+
     public static readonly Guid GUID_DEVINTERFACE_VOLUME =
         Guid.Parse("53f5630d-b6bf-11d0-94f2-00a0c91efb8b");
 

@@ -107,7 +107,7 @@ dotnet build -c Release
 | `Interop/NativeMethods.cs` | Win32-interop/helper'ы (ShowWindow, SetForegroundWindow и др.). |
 | `Interop/WindowMinSize.cs` | Минимальный размер окна через `WM_GETMINMAXINFO`. |
 | `Properties/AssemblyInfo.cs` | `InternalsVisibleTo("SmartUsbBackup.Tests")`. |
-| `SmartUsbBackup.Tests/` | xUnit-тесты: 101 тестовый случай. |
+| `SmartUsbBackup.Tests/` | xUnit-тесты: 104 тестовых случая. |
 | `installer/SmartUsbBackup.iss` | Скрипт Inno Setup (per-user install, деинсталляция, Pascal Script). |
 | `installer/dist/SmartUsbBackup-Setup-5.0.0.exe` | Собранный установщик (релиз). |
 | `CHANGELOG.md` | История изменений. |
@@ -124,7 +124,7 @@ dotnet build -c Release
 dotnet test SmartUsbBackup.Tests/SmartUsbBackup.Tests.csproj
 ```
 
-Все 101 тестовый случай.
+Все 104 тестовых случая.
 
 Сборка без Visual Studio:
 

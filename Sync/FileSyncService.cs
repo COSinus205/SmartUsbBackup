@@ -484,10 +484,16 @@ public sealed class FileSyncService
                                            .OrderByDescending(d => d.Length))
             {
                 ct.ThrowIfCancellationRequested();
-                if (!Directory.EnumerateFileSystemEntries(dir).Any())
+
+                // Один недоступный/занятый каталог не должен прерывать чистку
+                // остальных пустых папок.
+                try
                 {
-                    try { Directory.Delete(dir); } catch { /* занято — оставим до следующего раза */ }
+                    if (!Directory.EnumerateFileSystemEntries(dir).Any())
+                        Directory.Delete(dir);
                 }
+                catch (OperationCanceledException) { throw; }
+                catch { /* нет доступа/занято — оставим до следующего раза */ }
             }
         }
         catch (OperationCanceledException) { throw; }

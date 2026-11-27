@@ -166,17 +166,30 @@ public sealed class UsbDeviceWatcher
                     }
                     else if (hdr.dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE)
                     {
-                        DEV_BROADCAST_DEVICEINTERFACE dev;
-                        try { dev = Marshal.PtrToStructure<DEV_BROADCAST_DEVICEINTERFACE>(lParam); }
+                        // Для интерфейсов интересны только события извлечения:
+                        // на OPTIONS/ARRIVAL/REMOVECOMPLETE ничего не делаем и не
+                        // перечисляем диски в WndProc.
+                        if (evtLow is not (DBT_DEVICEQUERYREMOVE
+                                           or DBT_DEVICEQUERYREMOVEFAILED
+                                           or DBT_DEVICEQUERYREMOVEPENDING))
+                        {
+                            return DefSubclassProc(hWnd, msg, wParam, lParam);
+                        }
+
+                        DEV_BROADCAST_DEVICEINTERFACE_HEADER dev;
+                        try { dev = Marshal.PtrToStructure<DEV_BROADCAST_DEVICEINTERFACE_HEADER>(lParam); }
                         catch { dev = default; }
 
-                        char? mapped = TryMapDevicePathToDriveLetter(dev.dbcc_name);
+                        // Имя читаем по фактическому dbcc_size, а не по SizeConst=255:
+                        // иначе маршалинг читает за границей буфера.
+                        string deviceName = ReadDeviceInterfaceName(lParam, dev.dbcc_size);
+                        char? mapped = TryMapDevicePathToDriveLetter(deviceName);
 
                         switch (evtLow)
                         {
                             case DBT_DEVICEQUERYREMOVE:
                                 {
-                                    AppLog.Info($"[USB] QUERYREMOVE (iface): device='{dev.dbcc_name}', mapped={(mapped.HasValue ? mapped.Value.ToString() : "none")}");
+                                    AppLog.Info($"[USB] QUERYREMOVE (iface): device='{deviceName}', mapped={(mapped.HasValue ? mapped.Value.ToString() : "none")}");
                                     bool allow = true;
                                     if (mapped.HasValue)
                                     {
@@ -209,8 +222,23 @@ public sealed class UsbDeviceWatcher
         }
     }
 
-    private static char? TryMapDevicePathToDriveLetter(string? devicePath)
+    /// <summary>Читает null-terminated имя по фактическому размеру пакета.</summary>
+    private static string ReadDeviceInterfaceName(IntPtr lParam, int size)
     {
+        int offset = Marshal.SizeOf<DEV_BROADCAST_DEVICEINTERFACE_HEADER>();
+        if (size <= offset) return string.Empty;
+
+        int chars = (size - offset) / 2;
+        if (chars <= 0) return string.Empty;
+
+        var name = Marshal.PtrToStringUni(IntPtr.Add(lParam, offset), chars);
+        if (string.IsNullOrEmpty(name)) return string.Empty;
+
+        int nul = name.IndexOf('\0');
+        return nul >= 0 ? name[..nul] : name;
+    }
+
+    private static char? TryMapDevicePathToDriveLetter(string? devicePath)    {
         if (string.IsNullOrWhiteSpace(devicePath)) return null;
         var target = devicePath.Trim().TrimEnd('\\', '/');
         try

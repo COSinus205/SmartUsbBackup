@@ -40,6 +40,14 @@ public class UpdateServiceTests
         Assert.Null(UpdateService.ResolveTargetPath(dir, name));
     }
 
+    [Theory]
+    [InlineData(@"C:\Users\100%\setup.exe", @"C:\Users\100^%\setup.exe")]
+    [InlineData(@"C:\plain\setup.exe", @"C:\plain\setup.exe")]
+    public void EscapeForCmd_EscapesPercent(string input, string expected)
+    {
+        Assert.Equal(expected, UpdateService.EscapeForCmd(input));
+    }
+
     [Fact]
     public async Task VerifySha256Async_Match_ReturnsTrue()
     {
