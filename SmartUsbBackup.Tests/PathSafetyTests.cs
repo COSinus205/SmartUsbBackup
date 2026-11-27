@@ -43,4 +43,30 @@ public class PathSafetyTests
     {
         Assert.Equal(expected, PathSafety.IsReservedWindowsName(name));
     }
+
+    [Fact]
+    public void CanonicalizeBase_RejectsSubfolderOfWindows()
+    {
+        var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        Assert.False(string.IsNullOrWhiteSpace(windows));
+
+        Assert.Null(PathSafety.CanonicalizeBase(Path.Combine(windows, "Temp")));
+    }
+
+    [Fact]
+    public void CanonicalizeBase_RejectsSubfolderOfProgramFiles()
+    {
+        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        Assert.False(string.IsNullOrWhiteSpace(programFiles));
+
+        Assert.Null(PathSafety.CanonicalizeBase(Path.Combine(programFiles, "SomeApp", "Backups")));
+    }
+
+    [Theory]
+    [InlineData(@"\\?\C:\Backups")]
+    [InlineData(@"\\.\C:\Backups")]
+    public void CanonicalizeBase_RejectsDevicePaths(string path)
+    {
+        Assert.Null(PathSafety.CanonicalizeBase(path));
+    }
 }

@@ -52,6 +52,23 @@ public class SettingsTests
     }
 
     [Fact]
+    public void Load_DrivesWithNullEntry_IsFiltered()
+    {
+        using var isolation = new SettingsIsolation();
+
+        Directory.CreateDirectory(SettingsStore.Dir);
+        File.WriteAllText(
+            Path.Combine(SettingsStore.Dir, "settings.json"),
+            "{ \"baseBackupPath\": " + JsonSerializer.Serialize(SettingsStore.DefaultBasePath) +
+            ", \"drives\": [ null, { \"serial\": \"1\", \"label\": \"L\", \"folderName\": \"USB_L_1\" } ] }");
+
+        var loaded = LoadFresh();
+
+        var drive = Assert.Single(loaded.Drives);
+        Assert.Equal("1", drive.Serial);
+    }
+
+    [Fact]
     public void AutoCheckForUpdates_DefaultsToTrue()
     {
         Assert.True(new AppSettings().AutoCheckForUpdates);

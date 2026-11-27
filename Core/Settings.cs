@@ -162,6 +162,9 @@ public static class SettingsStore
                     // Нормализуем Profile.FolderName и персональные пути хранения.
                     // Явные null в JSON не должны превращаться в NRE дальше по коду.
                     s.Drives ??= new List<DriveProfile>();
+                    // `"drives": [null]` в JSON: без фильтра foreach ниже падает,
+                    // а внешний catch сбрасывает все настройки.
+                    s.Drives.RemoveAll(d => d is null);
                     foreach (var d in s.Drives)
                     {
                         d.Serial ??= "";
@@ -244,11 +247,19 @@ public static class SettingsStore
                     for (int i = 0; i < roots.Count; i++)
                         key.SetValue(RegBackupRootValuePrefix + i, roots[i]);
 
-                    // Подчищаем значения, оставшиеся от прошлых сохранений.
-                    for (int i = roots.Count; i < roots.Count + 16; i++)
+                    // Подчищаем значения, оставшиеся от прошлых сохранений
+                    // (без ограничения «первые 16»).
+                    foreach (var name in key.GetValueNames())
                     {
-                        try { key.DeleteValue(RegBackupRootValuePrefix + i, throwOnMissingValue: false); }
-                        catch { /* не критично */ }
+                        if (!name.StartsWith(RegBackupRootValuePrefix, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        var suffix = name.AsSpan(RegBackupRootValuePrefix.Length);
+                        if (int.TryParse(suffix, out int index) && index >= roots.Count)
+                        {
+                            try { key.DeleteValue(name, throwOnMissingValue: false); }
+                            catch { /* не критично */ }
+                        }
                     }
                 }
             }

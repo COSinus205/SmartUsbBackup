@@ -296,7 +296,7 @@ public sealed class UsbDeviceWatcher
         {
             try
             {
-                var info = QueryDrive(letter, retry: 3, delayMs: 200);
+                var info = QueryDrive(letter, retry: 10, delayMs: 300);
                 if (info is not null)
                 {
                     AppLog.Info($"WM_DEVICECHANGE: ARRIVAL {letter}: «{info!.Value.VolumeLabel}» serial={info.Value.Serial}");
@@ -398,7 +398,8 @@ public sealed class UsbDeviceWatcher
                     return (label.Length > 0 ? label.ToString() : "USB-накопитель", serial);
                 }
             }
-            Thread.Sleep(delayMs);
+            if (attempt < retry - 1 && delayMs > 0)
+                Thread.Sleep(delayMs);
         }
         return null;
     }

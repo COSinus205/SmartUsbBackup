@@ -68,9 +68,9 @@ public sealed class MirrorInaccessibleDirTests
             // И что снимок фиксирует каталог как недоступный (механизм BUG-02).
             var snapshot = typeof(FileSyncService).GetMethod(
                 "SnapshotFiles", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-            var args = new object?[] { src, null, null };
+            var args = new object?[] { src, null, System.Threading.CancellationToken.None, null };
             snapshot.Invoke(svc, args);
-            var inaccessible = (HashSet<string>)args[2]!;
+            var inaccessible = (HashSet<string>)args[3]!;
             Assert.Contains(locked, inaccessible, StringComparer.OrdinalIgnoreCase);
 
             // Меняем доступный файл, чтобы прогон дошёл до зеркальной чистки.

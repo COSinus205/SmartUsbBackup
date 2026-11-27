@@ -68,7 +68,7 @@ public sealed class FileSyncService
     /// обязана их не трогать, иначе бэкап теряет данные.
     /// </param>
     private List<FileMeta> SnapshotFiles(
-        string root, IProgress<SyncProgress>? progress, out HashSet<string> inaccessibleDirs)
+        string root, IProgress<SyncProgress>? progress, CancellationToken ct, out HashSet<string> inaccessibleDirs)
     {
         inaccessibleDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -88,11 +88,15 @@ public sealed class FileSyncService
 
         while (pending.Count > 0)
         {
+            ct.ThrowIfCancellationRequested();
+
             string dir = pending.Pop();
             try
             {
                 foreach (var entry in new DirectoryInfo(dir).EnumerateFileSystemInfos("*", opts))
                 {
+                    if ((count & 0xFF) == 0) ct.ThrowIfCancellationRequested();
+
                     if (entry is DirectoryInfo sub)
                     {
                         pending.Push(sub.FullName);
@@ -157,8 +161,12 @@ public sealed class FileSyncService
         long totalBytes = 0;
         try
         {
-            sourceFiles = SnapshotFiles(sourceDir, progress, out inaccessibleDirs);
+            sourceFiles = SnapshotFiles(sourceDir, progress, ct, out inaccessibleDirs);
             foreach (var f in sourceFiles) totalBytes += f.Size;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -170,8 +178,20 @@ public sealed class FileSyncService
         int copied = 0, skipped = 0;
         long bytesCopied = 0;
 
-        var targetIndex = BuildTargetIndex(targetDir);
+        var targetIndex = BuildTargetIndex(targetDir, ct);
         progress?.Report(new SyncProgress('\0', 0, sourceFiles.Count, 0, 0, 0, totalBytes, "", SyncPhase.Scanning));
+
+        // Пустой снимок источника при непустом бэкапе — почти всегда сбой
+        // (не смонтировалась ФС, драйвер, пустой том с тем же серийником),
+        // а не «пользователь всё удалил». Молча стирать копию нельзя.
+        if (sourceFiles.Count == 0 && targetIndex.Count > 0)
+        {
+            const string warning = "источник пуст — зеркальная чистка пропущена, бэкап сохранён; " +
+                                   "если флешка действительно пуста, удалите бэкап вручную";
+            AppLog.Warn($"{warning}: {sourceDir} → {targetDir}");
+            progress?.Report(new SyncProgress('\0', 0, 0, 0, 0, 0, 0, "", SyncPhase.Error));
+            return new SyncResult(0, 0, 0, 0, warning);
+        }
 
         // Предварительное создание целевых каталогов.
         var createdDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -365,7 +385,7 @@ public sealed class FileSyncService
         if (progress is not null && pruned > 0 && pruned != totalToPrune)
             progress.Report(new SyncProgress('\0', pruned, totalToPrune, copied, skipped, pruned, totalToPrune, "", SyncPhase.Pruning));
 
-        CleanupEmptyDirs(fullTargetDir);
+        CleanupEmptyDirs(fullTargetDir, ct);
         return pruned;
     }
 
@@ -383,7 +403,7 @@ public sealed class FileSyncService
     }
 
     /// <summary>Индекс приёмной папки: относительный путь → (размер, дата UTC).</summary>
-    private static Dictionary<string, FileKey> BuildTargetIndex(string targetDir)
+    private static Dictionary<string, FileKey> BuildTargetIndex(string targetDir, CancellationToken ct)
     {
         var idx = new Dictionary<string, FileKey>(StringComparer.OrdinalIgnoreCase);
         if (!Directory.Exists(targetDir)) return idx;
@@ -399,6 +419,7 @@ public sealed class FileSyncService
         };
         foreach (var fi in new DirectoryInfo(targetDir).EnumerateFiles("*", opts))
         {
+            ct.ThrowIfCancellationRequested();
             try { idx[Path.GetRelativePath(targetDir, fi.FullName)] = new FileKey(fi.Length, fi.LastWriteTimeUtc); }
             catch { /* файл мог исчезнуть во время обхода */ }
         }
@@ -449,7 +470,7 @@ public sealed class FileSyncService
     }
 
     /// <summary>Удаление опустевших папок после зеркальной чистки (с глубоких к корню).</summary>
-    private static void CleanupEmptyDirs(string root)
+    private static void CleanupEmptyDirs(string root, CancellationToken ct)
     {
         try
         {
@@ -462,12 +483,14 @@ public sealed class FileSyncService
             foreach (var dir in Directory.EnumerateDirectories(root, "*", opts)
                                            .OrderByDescending(d => d.Length))
             {
+                ct.ThrowIfCancellationRequested();
                 if (!Directory.EnumerateFileSystemEntries(dir).Any())
                 {
                     try { Directory.Delete(dir); } catch { /* занято — оставим до следующего раза */ }
                 }
             }
         }
+        catch (OperationCanceledException) { throw; }
         catch { /* не критично */ }
     }
 

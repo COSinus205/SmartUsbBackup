@@ -79,6 +79,33 @@ public sealed class DirectoryMoverTests
         }
     }
 
+    [Fact]
+    public void Move_ExistingDestination_MergesAndKeepsExtraFiles()
+    {
+        // Существующее назначение включает копирование (не Directory.Move) —
+        // проверяем, что копия сверяется и исходник удаляется только после неё.
+        var root = TempRoot();
+        var src = Path.Combine(root, "USB_X");
+        var dst = Path.Combine(root, "USB_X_existing");
+        Directory.CreateDirectory(src);
+        Directory.CreateDirectory(dst);
+        File.WriteAllText(Path.Combine(src, "a.txt"), "a");
+        File.WriteAllText(Path.Combine(dst, "keep.txt"), "k");
+
+        try
+        {
+            DirectoryMover.Move(src, dst);
+
+            Assert.False(Directory.Exists(src));
+            Assert.Equal("a", File.ReadAllText(Path.Combine(dst, "a.txt")));
+            Assert.Equal("k", File.ReadAllText(Path.Combine(dst, "keep.txt")));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
     private static string TempRoot() =>
         Path.Combine(Path.GetTempPath(), "smartusb_move_" + Guid.NewGuid().ToString("N"));
 

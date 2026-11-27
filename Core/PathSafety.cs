@@ -140,8 +140,17 @@ public static class PathSafety
         if (string.IsNullOrWhiteSpace(path) || !Path.IsPathRooted(path))
             return null;
 
+        // Устройство/verbatim-путь (`\\?\`, `\\.\`) не должен попадать в настройки:
+        // он обходит сравнение с системными каталогами.
+        var trimmed = path.Trim();
+        if (trimmed.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+            trimmed.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
         string full;
-        try { full = Path.GetFullPath(path); }
+        try { full = Path.GetFullPath(trimmed); }
         catch { return null; }
 
         if (!Path.IsPathRooted(full))
@@ -175,6 +184,28 @@ public static class PathSafety
             {
                 return null;
             }
+        }
+
+        // Внутри системных каталогов хранить бэкапы нельзя (не только ровно в них).
+        // LocalAppData/AppData/UserProfile сюда не входят: там подпапки разрешены
+        // (путь по умолчанию — %LocalAppData%\SmartUsbBackup\Backups).
+        var forbiddenTrees = new[]
+        {
+            Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+        };
+        foreach (var f in forbiddenTrees)
+        {
+            if (string.IsNullOrWhiteSpace(f)) continue;
+
+            string fullF;
+            try { fullF = Path.GetFullPath(f); }
+            catch { continue; }
+
+            if (IsInsideOrEqual(fullF, full))
+                return null;
         }
 
         // Любой прямой подкаталог Users\<имя> без своей подпапки запрещён.

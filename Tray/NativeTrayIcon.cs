@@ -68,7 +68,10 @@ internal sealed class NativeTrayIcon : IDisposable
     private readonly uint _taskbarCreatedMessage;
 
     private string _tip = "Smart USB Backup";
-    private bool _disposed;
+    private volatile bool _disposed;
+
+    /// <summary>Отменяет фоновое «продвижение» иконки при выходе/Dispose.</summary>
+    private readonly CancellationTokenSource _lifetime = new();
 
     /// <summary>Показать окно (правый клик → меню «Открыть окно»).</summary>
     public event Action? OpenRequested;
@@ -165,6 +168,7 @@ internal sealed class NativeTrayIcon : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        try { _lifetime.Cancel(); } catch { }
 
         try
         {
@@ -210,7 +214,16 @@ internal sealed class NativeTrayIcon : IDisposable
     {
         for (int attempt = 0; attempt < 10 && !_disposed; attempt++)
         {
-            await Task.Delay(300).ConfigureAwait(false);
+            try
+            {
+                await Task.Delay(300, _lifetime.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            if (_disposed) return;
 
             try
             {
@@ -226,6 +239,8 @@ internal sealed class NativeTrayIcon : IDisposable
 
     private bool TryPromoteIcon()
     {
+        if (_disposed) return true;
+
         var exePath = Environment.ProcessPath;
         if (string.IsNullOrEmpty(exePath)) return false;
 
@@ -249,6 +264,10 @@ internal sealed class NativeTrayIcon : IDisposable
             if (key.GetValue("IsPromoted") is not null) return true;
 
             key.SetValue("IsPromoted", 1, RegistryValueKind.DWord);
+
+            // Приложение уже закрывается: окно иконки могло быть уничтожено,
+            // повторный Shell_NotifyIcon не нужен (настройка уже записана).
+            if (_disposed) return true;
 
             // Explorer читает настройку в момент добавления иконки — пере-добавляем.
             var data = CreateData();

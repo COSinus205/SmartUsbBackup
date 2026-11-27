@@ -56,6 +56,14 @@ internal static class DirectoryMover
             var target = Path.Combine(destination, rel);
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
             File.Copy(file, target, true);
+
+            // Не удаляем исходник, пока не убедились, что копия целая
+            // (обрыв питания/диска не должен оставить «половину»).
+            var sourceLength = new FileInfo(file).Length;
+            var targetLength = new FileInfo(target).Length;
+            if (sourceLength != targetLength)
+                throw new IOException(
+                    $"Размер копии не совпал ({targetLength} вместо {sourceLength}); исходник оставлен: {target}");
         }
 
         foreach (var dir in Directory.EnumerateDirectories(source, "*", new EnumerationOptions
