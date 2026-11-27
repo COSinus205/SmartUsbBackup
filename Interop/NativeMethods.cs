@@ -150,10 +150,52 @@ internal static class NativeMethods
 
     private const uint WM_APP_RESTORE = 0x8001; // WM_APP + 1 — наша приватная команда
 
-    /// <summary>Посылает всем окнам (через HWND_BROADCAST) команду развернуться. Вызов из 2-го процесса.</summary>
+    private const int HWND_BROADCAST = 0xFFFF;
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr FindWindow(string? lpClassName, string lpWindowName);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    /// <summary>Заголовок главного окна — по нему второй экземпляр находит первый.</summary>
+    private const string MainWindowTitle = "Smart USB Backup";
+
+    /// <summary>
+    /// Просит уже запущенный экземпляр показать окно. Вызывается из второго процесса.
+    /// Broadcast на <see cref="HWND_BROADCAST"/> не доходит до скрытого окна WinUI,
+    /// поэтому окно ищется по заголовку и адресуется точечно.
+    /// </summary>
     public static void BroadcastRestoreWindow()
     {
-        PostMessage(IntPtr.Zero /* HWND_BROADCAST */, WM_APP_RESTORE, IntPtr.Zero, IntPtr.Zero);
+        var hwnd = FindWindow(null, MainWindowTitle);
+        if (hwnd != IntPtr.Zero && IsWindowOfSameProcess(hwnd))
+        {
+            PostMessage(hwnd, WM_APP_RESTORE, IntPtr.Zero, IntPtr.Zero);
+            return;
+        }
+
+        // Окно не нашли (например, другой процесс ещё не создал его) — старый путь.
+        PostMessage(new IntPtr(HWND_BROADCAST), WM_APP_RESTORE, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    private static bool IsWindowOfSameProcess(IntPtr hwnd)
+    {
+        try
+        {
+            GetWindowThreadProcessId(hwnd, out uint pid);
+            if (pid == 0) return false;
+
+            using var owner = Process.GetProcessById((int)pid);
+            return string.Equals(
+                owner.ProcessName,
+                Process.GetCurrentProcess().ProcessName,
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     public static bool IsRestoreMessage(uint msg) => msg == WM_APP_RESTORE;

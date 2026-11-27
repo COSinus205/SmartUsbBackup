@@ -70,18 +70,7 @@ public sealed class BackupOrchestrator : IDisposable
 
         // Бэкап на самой флешке (или внутри её корня) недопустим: иначе файлы
         // следующего прогона начнут копироваться внутрь уже созданной копии.
-        bool backupOnSource = false;
-        try
-        {
-            var backupFull = Path.GetFullPath(profile.BackupPath);
-            backupOnSource = PathSafety.IsSameVolume(backupFull, session.SourceRoot) ||
-                             PathSafety.IsInsideOrEqual(session.SourceRoot, backupFull);
-        }
-        catch (Exception ex)
-        {
-            AppLog.Error(ex, "Не удалось проверить путь бэкапа");
-            backupOnSource = true;
-        }
+        bool backupOnSource = IsBackupOnSource(session);
 
         AppLog.Info($"Флешка подключена: {e.DriveLetter}: «{profile.Label}» serial={profile.Serial}, резервирование={(profile.Enabled ? "вкл" : "выкл")}");
 
@@ -202,10 +191,46 @@ public sealed class BackupOrchestrator : IDisposable
     //  Полная зеркальная синхронизация
     // =====================================================================
 
-    /// <summary>Максимум 1 задача на флешку (анти-дубль при «дёрганье»).</summary>
+    /// <summary>
+    /// Бэкап лежит на том же томе, что и флешка (или внутри её корня). Копировать
+    /// в такую папку нельзя: зеркало начнёт складывать бэкап внутрь него самого.
+    /// При ошибке проверки — true (fail-closed).
+    /// </summary>
+    internal static bool IsBackupOnSource(ConnectedSession session)
+    {
+        try
+        {
+            var backupFull = Path.GetFullPath(session.BackupPath);
+            return PathSafety.IsSameVolume(backupFull, session.SourceRoot) ||
+                   PathSafety.IsInsideOrEqual(session.SourceRoot, backupFull);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error(ex, "Не удалось проверить путь бэкапа");
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Максимум 1 задача на флешку (анти-дубль при «дёрганье»).
+    /// </summary>
     private void StartFullSync(ConnectedSession session)
     {
         var key = session.Letter.ToString();
+
+        // Проверка обязательна и здесь: синхронизацию запускают не только по
+        // подключению, но и кнопкой/галочкой/двойным кликом. Иначе бэкап,
+        // оказавшийся на той же флешке (например, после переиспользования буквы),
+        // начнёт копироваться внутрь себя.
+        if (IsBackupOnSource(session))
+        {
+            const string error = "папка бэкапа находится на этой же флешке — выберите другую папку хранения";
+            session.State = SessionState.Error;
+            session.LastResult = error;
+            AppLog.Error(null, $"Синхронизация {key} отменена: папка бэкапа на источнике: {session.BackupPath}");
+            StateChanged?.Invoke();
+            return;
+        }
 
         lock (_fullSyncs)
         {

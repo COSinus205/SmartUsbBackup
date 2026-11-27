@@ -582,6 +582,26 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // Новая база не должна лежать внутри существующей папки бэкапа: иначе
+        // перенос скопирует бэкап в его же подпапку и удалит исходник.
+        foreach (var d in SettingsStore.Current.Drives)
+        {
+            if (!string.IsNullOrWhiteSpace(d.BaseBackupPathOverride)) continue;
+
+            var oldProfilePath = Path.Combine(oldBase, d.FolderName);
+            if (!Directory.Exists(oldProfilePath)) continue;
+
+            var newProfilePath = Path.Combine(canonical, d.FolderName);
+            if (PathSafety.IsInsideOrEqual(oldProfilePath, newProfilePath))
+            {
+                await ShowInfoAsync("Недопустимая папка",
+                    "Новая папка хранения находится внутри папки бэкапа флешки «" + d.Label + "». " +
+                    "Такой перенос удалил бы копию. Выберите другую папку.");
+                TxtBackupPath.Text = SettingsStore.Current.BaseBackupPath;
+                return;
+            }
+        }
+
         // Перенос касается только профилей без персонального пути.
         var movable = SettingsStore.Current.Drives
             .Where(d => string.IsNullOrWhiteSpace(d.BaseBackupPathOverride))
@@ -648,7 +668,7 @@ public sealed partial class MainWindow : Window
                 try
                 {
                     TxtGlobalStatus.Text = $"Перенос «{item.Profile.Label}»…";
-                    await Task.Run(() => MoveDirectoryTree(item.OldPath, item.NewPath));
+                    await Task.Run(() => DirectoryMover.Move(item.OldPath, item.NewPath));
                     moved++;
                 }
                 catch (Exception ex)
@@ -1002,6 +1022,14 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        string newPath = Path.Combine(newBase, profile.FolderName);
+        if (PathSafety.IsInsideOrEqual(oldPath, newPath))
+        {
+            AppLog.Warn($"Перенос «{profile.Label}» отменён: новая папка внутри текущей: {newPath}");
+            TxtGlobalStatus.Text = "Нельзя выбрать папку внутри текущего бэкапа. Выберите другую.";
+            return;
+        }
+
         // Останавливаем активную синхронизацию этой флешки, чтобы не писать во время переноса.
         var session = _orchestrator.ActiveSessions.FirstOrDefault(s =>
             ReferenceEquals(s.Profile, profile) ||
@@ -1014,12 +1042,11 @@ public sealed partial class MainWindow : Window
                 await Task.WhenAny(running, Task.Delay(5000)).ConfigureAwait(false);
         }
 
-        string newPath = Path.Combine(newBase, profile.FolderName);
         progress.Report(new SyncProgress(profile.DriveLetter, 0, 1, 0, 0, 0, 1, "", SyncPhase.Moving) { DriveName = profile.Label });
 
         if (Directory.Exists(oldPath))
         {
-            await Task.Run(() => MoveDirectoryTree(oldPath, newPath));
+            await Task.Run(() => DirectoryMover.Move(oldPath, newPath));
         }
 
         // Обновляем хранилище (null = стандартный глобальный путь).
@@ -1035,42 +1062,6 @@ public sealed partial class MainWindow : Window
         // прогон уже в новую папку (если она всё ещё подключена).
         if (profile.Enabled)
             _orchestrator.SyncOne(profile);
-    }
-
-    private static void MoveDirectoryTree(string source, string destination)
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-
-        if (!Directory.Exists(destination))
-        {
-            try
-            {
-                Directory.Move(source, destination);
-                return;
-            }
-            catch (IOException)
-            {
-                // Кросс-томовый перенос: копируем + удаляем исходное.
-            }
-        }
-
-        if (!Directory.Exists(destination))
-            Directory.CreateDirectory(destination);
-
-        foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
-        {
-            var rel = Path.GetRelativePath(source, file);
-            var target = Path.Combine(destination, rel);
-            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            File.Copy(file, target, true);
-        }
-
-        foreach (var dir in Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories)
-                                     .OrderByDescending(d => d.Length))
-        {
-            try { if (!Directory.EnumerateFileSystemEntries(dir).Any()) Directory.Delete(dir); } catch { }
-        }
-        try { Directory.Delete(source, recursive: true); } catch { /* уже очищено */ }
     }
 
     private static string BuildDriveStatusText(DriveProfile profile)
