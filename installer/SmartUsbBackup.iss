@@ -1,5 +1,5 @@
 ﻿; =====================================================================
-;  Smart USB Backup 2.0 — Inno Setup Script (Inno Setup 6.x)
+;  Smart USB Backup 5.0.1 — Inno Setup Script (Inno Setup 6.x)
 ;
 ;  Что делает:
 ;    • Устанавливает publish-папку self-contained WinUI 3-приложения в

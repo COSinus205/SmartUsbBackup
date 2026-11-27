@@ -26,6 +26,7 @@
 - Профили флешек по серийному номеру: включение резервирования и персональная папка хранения.
 - Автоматическое копирование при подключении включённой флешки и ручная синхронизация по кнопке.
 - Поддержка обычных флешек и внешних USB HDD/SSD.
+- Защита от ошибочной очистки: если снимок источника внезапно пуст, а в бэкапе есть файлы, зеркальная чистка пропускается.
 - Адаптивный Fluent-интерфейс: одна страница, настройки в диалогах, тёмная/светлая тема, Mica.
 - Работа в фоне и из системного трея, автопроверка обновлений.
 
@@ -36,7 +37,7 @@
 Сборка приложения:
 
 ```bat
-dotnet publish -c Release
+dotnet publish -c Release -p:Platform=x64
 ```
 
 Результат: `bin/publish/SmartUsbBackup.exe` и все необходимые файлы (self-contained).
@@ -44,7 +45,7 @@ dotnet publish -c Release
 Для разработки достаточно:
 
 ```bat
-dotnet build -c Release
+dotnet build -c Release -p:Platform=x64
 ```
 
 ## Установщик
@@ -75,10 +76,10 @@ dotnet build -c Release
 
 | Настройка | По умолчанию | Назначение |
 |---|---|---|
-| `BaseBackupPath` | `%LocalAppData%\SmartUsbBackup\Backups` | Папка хранения копий. |
-| `AutoCheckForUpdates` | `true` | Автопроверка обновлений (не чаще раза в сутки). |
-| `LastUpdateCheck` | `DateTime.MinValue` | Время последней проверки обновлений. |
-| `Drives` | `[]` | Профили флешек: `Serial`, `Label`, `FolderName`, `Enabled`, `BaseBackupPathOverride`. |
+| `baseBackupPath` | `%LocalAppData%\SmartUsbBackup\Backups` | Папка хранения копий. |
+| `autoCheckForUpdates` | `true` | Автопроверка обновлений (не чаще раза в сутки). |
+| `lastUpdateCheck` | `DateTime.MinValue` | Время последней проверки обновлений. |
+| `drives` | `[]` | Профили флешек: `serial`, `label`, `folderName`, `enabled`, `baseBackupPathOverride`. |
 
 Автозапуск с Windows хранится не в JSON, а в `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
@@ -96,8 +97,10 @@ dotnet build -c Release
 | `build-installer.bat` | Сборка через `dotnet publish` + Inno Setup. |
 | `README.md` | Документация проекта. |
 | `Core/AppLog.cs` | Логирование (`AppLog.Info/Error`). |
-| `Core/BackupPresenceCache.cs` | Кэш «в папке бэкапа есть содержимое» — без дискового I/O на UI-потоке. |
+| `Core/BackupPresenceCache.cs` | Кэш «в папке бэкапа есть содержимое» (2 с), чтобы не опрашивать диск на каждое обновление строки. |
+| `Core/DirectoryMover.cs` | Перенос папки бэкапа: запрет вложенного назначения, копирование со сверкой размера, удаление исходника только после проверки. |
 | `Core/DriveRow.cs` | Модель строки таблицы флешек (INotifyPropertyChanged). |
+| `Core/PathSafety.cs` | Проверки путей: запрет корня/системных каталогов, device-путей, раскрытие 8.3-алиасов. |
 | `Core/Settings.cs` | `AppSettings`/`SettingsStore`, чтение/сохранение `settings.json`. |
 | `Core/UpdateService.cs` | Проверка и скачивание обновлений через GitHub Releases. |
 | `Sync/BackupOrchestrator.cs` | Оркестрация синхронизации (подключение/отключение, sync all/one, wipe, safe-remove). |
@@ -105,12 +108,15 @@ dotnet build -c Release
 | `Usb/UsbDeviceWatcher.cs` | `WM_DEVICECHANGE` через subclass окна. |
 | `Tray/NativeTrayIcon.cs` | Трей: `Shell_NotifyIcon`, меню, balloon. |
 | `Interop/NativeMethods.cs` | Win32-interop/helper'ы (ShowWindow, SetForegroundWindow и др.). |
+| `Interop/WinTrust.cs` | Authenticode-проверка установщика перед запуском. |
 | `Interop/WindowMinSize.cs` | Минимальный размер окна через `WM_GETMINMAXINFO`. |
 | `Properties/AssemblyInfo.cs` | `InternalsVisibleTo("SmartUsbBackup.Tests")`. |
+| `.github/workflows/ci.yml` | CI: restore, build и тесты на `windows-latest`. |
 | `SmartUsbBackup.Tests/` | xUnit-тесты: 106 тестовых случаев. |
 | `installer/SmartUsbBackup.iss` | Скрипт Inno Setup (per-user install, деинсталляция, Pascal Script). |
 | `installer/dist/SmartUsbBackup-Setup-5.0.1.exe` | Собранный установщик (релиз). |
 | `CHANGELOG.md` | История изменений. |
+| `BUGS.md` | Открытые дефекты, исправления 5.0.x и что не проверялось. |
 
 > Тестовый харнесс `ejecttest` **не входит в репозиторий**; для локальных копий действуют правила `.gitignore` (`tools/ejecttest/`, `ejecttest/`, `*.ejecttest.*`).
 
@@ -121,7 +127,7 @@ dotnet build -c Release
 Запуск тестов локально:
 
 ```bat
-dotnet test SmartUsbBackup.Tests/SmartUsbBackup.Tests.csproj
+dotnet test SmartUsbBackup.Tests/SmartUsbBackup.Tests.csproj -c Release -p:Platform=x64
 ```
 
 Все 106 тестовых случаев.
@@ -152,6 +158,7 @@ dotnet build SmartUsbBackup.WinUI.csproj -c Release -p:Platform=x64
 - [CHANGELOG.md](CHANGELOG.md) — история изменений.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — как собрать, запустить тесты и собрать установщик.
 - [SECURITY.md](SECURITY.md) — политика безопасности.
+- [BUGS.md](BUGS.md) — открытые дефекты и что не проверялось.
 
 ## Лицензия
 

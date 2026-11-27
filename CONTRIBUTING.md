@@ -3,8 +3,8 @@
 ## Как собрать
 
 ```bat
-dotnet build -c Release
-dotnet publish -c Release
+dotnet build -c Release -p:Platform=x64
+dotnet publish -c Release -p:Platform=x64
 ```
 
 Результат публикации — папка `bin/publish/` (self-contained WinUI 3, .NET 8).
@@ -12,10 +12,10 @@ dotnet publish -c Release
 ## Как запустить тесты
 
 ```bat
-dotnet test SmartUsbBackup.Tests/SmartUsbBackup.Tests.csproj
+dotnet test SmartUsbBackup.Tests/SmartUsbBackup.Tests.csproj -c Release -p:Platform=x64
 ```
 
-Все 92 тестовых случая (47 `[Fact]` + 45 `[InlineData]` в 8 `[Theory]`) должны проходить.
+Все 106 тестовых случаев должны проходить.
 
 ## Как собрать установщик
 
