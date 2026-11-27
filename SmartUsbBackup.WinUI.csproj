@@ -52,6 +52,13 @@
     <SatelliteResourceLanguages>ru;en</SatelliteResourceLanguages>
     <DebugType>embedded</DebugType>
 
+    <!--
+      Папка тестов не должна попадать в default-глобы основного проекта: иначе
+      её bin/obj копируются в выход приложения, а следующая сборка копирует уже
+      разросшуюся копию — получается рекурсивное дерево с путями > 260 символов.
+    -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);SmartUsbBackup.Tests\**</DefaultItemExcludes>
+
     <AssemblyName>SmartUsbBackup</AssemblyName>
     <RootNamespace>SmartUsbBackup</RootNamespace>
     <Version>5.0.1</Version>
@@ -71,10 +78,7 @@
     <PublishDir>$(MSBuildThisFileDirectory)bin\publish\</PublishDir>
   </PropertyGroup>
 
-  <!-- Тесты живут в отдельном проекте SmartUsbBackup.Tests и не должны компилироваться в основной сборке -->
-  <ItemGroup>
-    <Compile Remove="SmartUsbBackup.Tests\**\*.cs" />
-  </ItemGroup>
+  <!-- Тесты — отдельный проект; папка исключена из default-глобов выше. -->
 
   <!--
     dotnet publish не переносит resources.pri в папку публикации (в отличие от обычной сборки),
