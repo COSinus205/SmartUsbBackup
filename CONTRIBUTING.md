@@ -29,6 +29,14 @@ build-installer.bat
 
 Результат — `installer/dist/SmartUsbBackup-Setup-5.0.1.exe` (версия берётся из `installer/SmartUsbBackup.iss`, `#define MyAppVersion`).
 
+## Публикация релиза
+
+1. Поднять версию в `SmartUsbBackup.WinUI.csproj` и `installer/SmartUsbBackup.iss`.
+2. Обновить `CHANGELOG.md`, `README.md`, `BUGS.md` и счётчик тестов.
+3. Прогнать `dotnet test SmartUsbBackup.Tests/SmartUsbBackup.Tests.csproj -c Release -p:Platform=x64`.
+4. Собрать установщик через `build-installer.bat` и записать SHA-256 рядом с exe.
+5. Создать тег `vX.Y.Z` и релиз на GitHub с `SmartUsbBackup-Setup-X.Y.Z.exe` и `.sha256`.
+
 ## Стиль кода
 
 - Придерживаться существующего стиля и структуры проекта.
