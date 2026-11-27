@@ -21,6 +21,12 @@ internal static class NativeMethods
     public const int DBT_DEVTYP_VOLUME            = 0x00000002;
     public const int DBT_DEVTYP_DEVICEINTERFACE   = 0x00000005;
 
+    /// <summary>Том с медиа: вставка/извлечение карты в кардридере.</summary>
+    public const int DBTF_MEDIA                   = 0x0001;
+
+    /// <summary>Сетевой том — бэкапить не нужно, события пропускаем.</summary>
+    public const int DBTF_NET                     = 0x0002;
+
     /// <summary>Единственный корректный отказ на DBT_DEVICEQUERYREMOVE.</summary>
     public const int BROADCAST_QUERY_DENY         = 0x424D5144;
 

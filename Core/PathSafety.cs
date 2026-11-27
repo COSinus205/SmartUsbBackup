@@ -1,5 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
 
 namespace SmartUsbBackup.Core;
 
@@ -153,6 +156,9 @@ public static class PathSafety
         try { full = Path.GetFullPath(trimmed); }
         catch { return null; }
 
+        // 8.3-алиасы (`PROGRA~1`) раскрываем, иначе они обходят проверки ниже.
+        full = ExpandShortPath(full);
+
         if (!Path.IsPathRooted(full))
             return null;
 
@@ -218,5 +224,54 @@ public static class PathSafety
         }
 
         return full;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetLongPathNameW(
+        string lpszShortPath, StringBuilder lpszLongPath, uint cchBuffer);
+
+    /// <summary>
+    /// Раскрывает 8.3-алиасы существующей части пути. Для обычных путей
+    /// (без `~`) ничего не делает и не трогает диск.
+    /// </summary>
+    private static string ExpandShortPath(string full)
+    {
+        if (!full.Contains('~'))
+            return full;
+
+        try
+        {
+            string existing = full;
+            var tail = new Stack<string>();
+
+            while (!string.IsNullOrEmpty(existing) &&
+                   !Directory.Exists(existing) && !File.Exists(existing))
+            {
+                var parent = Path.GetDirectoryName(existing);
+                if (string.IsNullOrEmpty(parent) || string.Equals(parent, existing, StringComparison.OrdinalIgnoreCase))
+                    break;
+
+                tail.Push(Path.GetFileName(existing));
+                existing = parent;
+            }
+
+            if (string.IsNullOrEmpty(existing) || (!Directory.Exists(existing) && !File.Exists(existing)))
+                return full;
+
+            var sb = new StringBuilder(existing.Length + 260);
+            uint n = GetLongPathNameW(existing, sb, (uint)sb.Capacity);
+            if (n == 0 || n >= sb.Capacity)
+                return full;
+
+            string expanded = sb.ToString(0, (int)n);
+            while (tail.Count > 0)
+                expanded = Path.Combine(expanded, tail.Pop());
+
+            return expanded;
+        }
+        catch
+        {
+            return full;
+        }
     }
 }

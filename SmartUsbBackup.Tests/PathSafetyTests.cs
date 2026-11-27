@@ -69,4 +69,14 @@ public class PathSafetyTests
     {
         Assert.Null(PathSafety.CanonicalizeBase(path));
     }
+
+    [Fact]
+    public void CanonicalizeBase_Expands8_3_WhenAvailable()
+    {
+        // 8.3-имена могут быть отключены на томе — тогда проверять нечего.
+        const string shortProgramFiles = @"C:\PROGRA~1";
+        if (!Directory.Exists(shortProgramFiles)) return;
+
+        Assert.Null(PathSafety.CanonicalizeBase(Path.Combine(shortProgramFiles, "Backups")));
+    }
 }

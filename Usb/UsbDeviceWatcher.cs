@@ -127,7 +127,7 @@ public sealed class UsbDeviceWatcher
                     {
                         var vol = Marshal.PtrToStructure<DEV_BROADCAST_VOLUME>(lParam);
 
-                        if (vol.dbcv_flags == 0)
+                        if ((vol.dbcv_flags & DBTF_NET) == 0)
                         {
                             switch (evtLow)
                             {

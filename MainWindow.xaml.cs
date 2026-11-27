@@ -52,6 +52,7 @@ public sealed partial class MainWindow : Window
     // Собственная иконка трея (Shell_NotifyIcon). Создаётся в конструкторе.
     private NativeTrayIcon? _tray;
     private bool _checkingUpdate;
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _updateTimer;
 
     public static MainWindow? Instance;
     public static DispatcherQueue? UiDispatcher;
@@ -127,6 +128,14 @@ public sealed partial class MainWindow : Window
         // Activated не приходит — и проверка не выполнялась.
         _ = Task.Delay(8000).ContinueWith(_ =>
             _dq.TryEnqueue(() => _ = SafeFireAndForget(CheckForUpdatesAsync(false))));
+
+        // Пока приложение живёт в трее, проверяем обновления и позже: сам
+        // CheckForUpdatesAsync пропускает повтор в течение 24 часов после
+        // успешной проверки, поэтому час — безопасный интервал опроса.
+        _updateTimer = _dq.CreateTimer();
+        _updateTimer.Interval = TimeSpan.FromHours(1);
+        _updateTimer.Tick += (_, _) => _ = SafeFireAndForget(CheckForUpdatesAsync(false));
+        _updateTimer.Start();
     }
 
     // =====================================================================
@@ -1742,6 +1751,7 @@ public sealed partial class MainWindow : Window
 
         _isExiting = true;
 
+        try { _updateTimer?.Stop(); } catch { }
         try { await _orchestrator.DisposeAsync(); } catch { /* не блокируем выход */ }
         try { _tray?.Dispose(); } catch { }
         try { App.ReleaseMutex(); } catch { }
@@ -1761,6 +1771,7 @@ public sealed partial class MainWindow : Window
         // и копирование, убираем иконку и завершаем приложение.
         _isExiting = true;
 
+        try { _updateTimer?.Stop(); } catch { }
         try { _orchestrator.Dispose(); } catch { }
         try { _tray?.Dispose(); } catch { }
 

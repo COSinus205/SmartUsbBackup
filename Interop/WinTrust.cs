@@ -100,7 +100,6 @@ internal static class WinTrust
 
             // close state
             dataRef.dwStateAction = WTD_STATEACTION_CLOSE;
-            dataRef.hWVTStateData = IntPtr.Zero;
             WinVerifyTrust(IntPtr.Zero, ref GenericVerifyV2, ref dataRef);
 
             if (hr != 0)
